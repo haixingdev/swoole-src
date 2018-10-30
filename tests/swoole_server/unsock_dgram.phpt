@@ -2,16 +2,10 @@
 swoole_server: unix socket dgram server
 
 --SKIPIF--
-<?php require __DIR__ . "/../include/skipif.inc"; ?>
---INI--
-assert.active=1
-assert.warning=1
-assert.bail=0
-assert.quiet_eval=0
-
+<?php require __DIR__ . '/../include/skipif.inc'; ?>
 --FILE--
 <?php
-require_once __DIR__ . "/../include/swoole.inc";
+require __DIR__ . '/../include/bootstrap.php';
 
 parent_child(function ($pid)
 {
@@ -45,8 +39,6 @@ parent_child(function ($pid)
     $serv->start();
 });
 ?>
-
 --EXPECT--
 SUCCESS
-
 

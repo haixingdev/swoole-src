@@ -19,11 +19,24 @@
 #ifndef SWOOLE_MYSQL_H_
 #define SWOOLE_MYSQL_H_
 
-//#define SW_MYSQL_STRICT_TYPE
+BEGIN_EXTERN_C()
+
+#ifdef SW_USE_MYSQLND
+#include "ext/mysqlnd/mysqlnd.h"
+#include "ext/mysqlnd/mysqlnd_charset.h"
+#endif
+
+#ifdef SW_USE_OPENSSL
+#ifndef OPENSSL_NO_RSA
+#define SW_MYSQL_RSA_SUPPORT
+#endif
+#endif
+
 //#define SW_MYSQL_DEBUG
 
 enum mysql_command
 {
+    SW_MYSQL_COM_NULL = -1,
     SW_MYSQL_COM_SLEEP = 0,
     SW_MYSQL_COM_QUIT,
     SW_MYSQL_COM_INIT_DB,
@@ -60,9 +73,25 @@ enum mysql_command
 enum mysql_handshake_state
 {
     SW_MYSQL_HANDSHAKE_WAIT_REQUEST,
+    SW_MYSQL_HANDSHAKE_WAIT_SWITCH,
+    SW_MYSQL_HANDSHAKE_WAIT_SIGNATURE,
+    SW_MYSQL_HANDSHAKE_WAIT_RSA,
     SW_MYSQL_HANDSHAKE_WAIT_RESULT,
     SW_MYSQL_HANDSHAKE_COMPLETED,
 };
+
+enum mysql_auth_signature
+{
+    SW_MYSQL_AUTH_SIGNATURE_ERROR = 0x00, // get signature failed
+    SW_MYSQL_AUTH_SIGNATURE = 0x01,
+    SW_MYSQL_AUTH_SIGNATURE_RSA_PREPARED = 0x02,
+    SW_MYSQL_AUTH_SIGNATURE_SUCCESS = 0x03,
+    SW_MYSQL_AUTH_SIGNATURE_FULL_AUTH_REQUIRED = 0x04, //rsa required
+};
+
+// nonce: a number or bit string used only once, in security engineering
+// other names on doc: challenge/scramble/salt
+#define SW_MYSQL_NONCE_LENGTH 20
 
 enum mysql_read_state
 {
@@ -146,11 +175,59 @@ typedef enum
 } mysql_io_status;
 #endif
 
-#define SW_MYSQL_CLIENT_CONNECT_WITH_DB          8
-#define SW_MYSQL_CLIENT_PROTOCOL_41              512
-#define SW_MYSQL_CLIENT_PLUGIN_AUTH              (1UL << 19)
-#define SW_MYSQL_CLIENT_CONNECT_ATTRS            (1UL << 20)
-#define SW_MYSQL_CLIENT_SECURE_CONNECTION        32768
+// ref: https://dev.mysql.com/doc/dev/mysql-server/8.0.0/group__group__cs__capabilities__flags.html
+// use regex: "\#define[ ]+(CLIENT_[A-Z_\d]+)[ ]+(\(?[\dA-Z <]+\)?)\n[ ]+?[ ]+([\s\S ]+?\.) More\.\.\.\n?"
+// to "SW_MYSQL_$1 = $2, /* $3 */"
+enum mysql_client_capability_flags
+{
+    SW_MYSQL_CLIENT_LONG_PASSWORD = 1, /* Use the improved version of Old Password Authentication. */
+    SW_MYSQL_CLIENT_FOUND_ROWS = 2, /* Send found rows instead of affected rows in EOF_Packet. */
+    SW_MYSQL_CLIENT_LONG_FLAG = 4, /* Get all column flags. */
+    SW_MYSQL_CLIENT_CONNECT_WITH_DB = 8, /* Database (schema) name can be specified on connect in Handshake Response Packet. */
+    SW_MYSQL_CLIENT_NO_SCHEMA = 16, /* Don't allow database.table.column. */
+    SW_MYSQL_CLIENT_COMPRESS = 32, /* Compression protocol supported. */
+    SW_MYSQL_CLIENT_ODBC = 64, /* Special handling of ODBC behavior. */
+    SW_MYSQL_CLIENT_LOCAL_FILES = 128, /* Can use LOAD DATA LOCAL. */
+    SW_MYSQL_CLIENT_IGNORE_SPACE = 256, /* Ignore spaces before '('. */
+    SW_MYSQL_CLIENT_PROTOCOL_41 = 512, /* New 4.1 protocol. */
+    SW_MYSQL_CLIENT_INTERACTIVE = 1024, /* This is an interactive client. */
+    SW_MYSQL_CLIENT_SSL = 2048, /* Use SSL encryption for the session. */
+    SW_MYSQL_CLIENT_IGNORE_SIGPIPE = 4096, /* Client only flag. */
+    SW_MYSQL_CLIENT_TRANSACTIONS = 8192, /* Client knows about transactions. */
+    SW_MYSQL_CLIENT_RESERVED = 16384, /* flag for 4.1 protocol. */
+    SW_MYSQL_CLIENT_SECURE_CONNECTION = 32768, /* swoole custom name for RESERVED2.  */
+    SW_MYSQL_CLIENT_RESERVED2 = 32768, /* flag for 4.1 authentication. */
+    SW_MYSQL_CLIENT_MULTI_STATEMENTS = (1UL << 16), /* Enable/disable multi-stmt support. */
+    SW_MYSQL_CLIENT_MULTI_RESULTS = (1UL << 17), /* Enable/disable multi-results. */
+    SW_MYSQL_CLIENT_PS_MULTI_RESULTS = (1UL << 18), /* Multi-results and OUT parameters in PS-protocol. */
+    SW_MYSQL_CLIENT_PLUGIN_AUTH = (1UL << 19), /* Client supports plugin authentication. */
+    SW_MYSQL_CLIENT_CONNECT_ATTRS = (1UL << 20), /* Client supports connection attributes. */
+    SW_MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = (1UL << 21), /* Enable authentication response packet to be larger than 255 bytes. */
+    SW_MYSQL_CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS = (1UL << 22), /* Don't close the connection for a user account with expired password. */
+    SW_MYSQL_CLIENT_SESSION_TRACK = (1UL << 23), /* Capable of handling server state change information. */
+    SW_MYSQL_CLIENT_DEPRECATE_EOF = (1UL << 24), /* Client no longer needs EOF_Packet and will use OK_Packet instead. */
+    SW_MYSQL_CLIENT_SSL_VERIFY_SERVER_CERT = (1UL << 30), /* Verify server certificate. */
+    SW_MYSQL_CLIENT_REMEMBER_OPTIONS = (1UL << 31) /* Don't reset the options after an unsuccessful connect. */
+};
+
+// ref: https://dev.mysql.com/doc/internals/en/status-flags.html
+enum mysql_server_status_flags
+{
+    SW_MYSQL_SERVER_STATUS_IN_TRANS = 0x0001, // a transaction is active
+    SW_MYSQL_SERVER_STATUS_AUTOCOMMIT = 0x0002, //auto-commit is enabled
+    SW_MYSQL_SERVER_MORE_RESULTS_EXISTS = 0x0008,
+    SW_MYSQL_SERVER_STATUS_NO_GOOD_INDEX_USED = 0x0010,
+    SW_MYSQL_SERVER_STATUS_NO_INDEX_USED = 0x0020,
+    SW_MYSQL_SERVER_STATUS_CURSOR_EXISTS = 0x0040, // Used by Binary Protocol Resultset to signal that COM_STMT_FETCH must be used to fetch the row-data.
+    SW_MYSQL_SERVER_STATUS_LAST_ROW_SENT = 0x0080,
+    SW_MYSQL_SERVER_STATUS_DB_DROPPED = 0x0100,
+    SW_MYSQL_SERVER_STATUS_NO_BACKSLASH_ESCAPES = 0x0200,
+    SW_MYSQL_SERVER_STATUS_METADATA_CHANGED = 0x0400,
+    SW_MYSQL_SERVER_QUERY_WAS_SLOW = 0x0800,
+    SW_MYSQL_SERVER_PS_OUT_PARAMS = 0x1000,
+    SW_MYSQL_SERVER_STATUS_IN_TRANS_READONLY = 0x2000, // in a read-only transaction
+    SW_MYSQL_SERVER_SESSION_STATE_CHANGED = 0x4000 // connection state information has changed
+};
 
 typedef struct
 {
@@ -159,7 +236,7 @@ typedef struct
     uint8_t protocol_version;
     char *server_version;
     int connection_id;
-    char auth_plugin_data[21];
+    char auth_plugin_data[SW_MYSQL_NONCE_LENGTH + 1]; // nonce + '\0'
     uint8_t l_auth_plugin_data;
     char filler;
     int capability_flags;
@@ -177,11 +254,12 @@ typedef struct
     char *password;
     char *database;
     zend_bool strict_type;
+    zend_bool fetch_mode;
 
-    zend_size_t host_len;
-    zend_size_t user_len;
-    zend_size_t password_len;
-    zend_size_t database_len;
+    size_t host_len;
+    size_t user_len;
+    size_t password_len;
+    size_t database_len;
 
     long port;
     double timeout;
@@ -192,6 +270,9 @@ typedef struct
     char character_set;
     int packet_length;
     char buf[512];
+#ifdef SW_USE_OPENSSL
+    char auth_plugin_data[SW_MYSQL_NONCE_LENGTH]; // save challenge data for RSA auth
+#endif
 
     uint16_t error_code;
     char *error_msg;
@@ -248,6 +329,8 @@ typedef struct
     uint16_t unreaded_param_count;
     struct _mysql_client *client;
     zval *object;
+    swString *buffer; /* save the mysql multi responses data */
+    zval *result; /* save the zval array result */
 } mysql_statement;
 
 typedef struct
@@ -281,9 +364,10 @@ typedef struct _mysql_client
     int cid;
 #endif
     uint8_t state;
+    uint32_t switch_check :1; /* check if server request auth switch */
     uint8_t handshake;
-    uint8_t cmd;
-    swString *buffer;
+    uint8_t cmd; /* help with judging to do what in callback */
+    swString *buffer; /* save the mysql responses data */
     swClient *cli;
     zval *object;
     zval *callback;
@@ -291,7 +375,6 @@ typedef struct _mysql_client
     int fd;
     uint32_t transaction :1;
     uint32_t connected :1;
-    uint32_t strict;
 
     mysql_connector connector;
     mysql_statement *statement;
@@ -299,12 +382,33 @@ typedef struct _mysql_client
 
     swTimer_node *timer;
 
-#if PHP_MAJOR_VERSION >= 7
     zval _object;
     zval _onClose;
-#endif
-    mysql_response_t response;
+
+    off_t check_offset;
+    mysql_response_t response; /* single response */
+
 } mysql_client;
+
+#define mysql_request_buffer (SwooleTG.buffer_stack)
+
+#define SW_MYSQL_NOT_NULL_FLAG               1
+#define SW_MYSQL_PRI_KEY_FLAG                2
+#define SW_MYSQL_UNIQUE_KEY_FLAG             4
+#define SW_MYSQL_MULTIPLE_KEY_FLAG           8
+#define SW_MYSQL_BLOB_FLAG                  16
+#define SW_MYSQL_UNSIGNED_FLAG              32
+#define SW_MYSQL_ZEROFILL_FLAG              64
+#define SW_MYSQL_BINARY_FLAG               128
+#define SW_MYSQL_ENUM_FLAG                 256
+#define SW_MYSQL_AUTO_INCREMENT_FLAG       512
+#define SW_MYSQL_TIMESTAMP_FLAG           1024
+#define SW_MYSQL_SET_FLAG                 2048
+#define SW_MYSQL_NO_DEFAULT_VALUE_FLAG    4096
+#define SW_MYSQL_ON_UPDATE_NOW_FLAG       8192
+#define SW_MYSQL_PART_KEY_FLAG           16384
+#define SW_MYSQL_GROUP_FLAG              32768
+#define SW_MYSQL_NUM_FLAG                32768
 
 #define mysql_uint2korr(A)  (uint16_t) (((uint16_t) ((zend_uchar) (A)[0])) +\
                                ((uint16_t) ((zend_uchar) (A)[1]) << 8))
@@ -358,12 +462,18 @@ typedef struct _mysql_client
                 mysql_int4store((T),def_temp); \
                 mysql_int4store((T+4),def_temp2); } while (0)
 
+#define MYSQL_RESPONSE_BUFFER  (client->cmd == SW_MYSQL_COM_STMT_EXECUTE ? client->statement->buffer : client->buffer)
+
 int mysql_get_result(mysql_connector *connector, char *buf, int len);
 int mysql_get_charset(char *name);
 int mysql_handshake(mysql_connector *connector, char *buf, int len);
+int mysql_parse_auth_signature(swString *buffer, mysql_connector *connector);
+int mysql_parse_rsa(mysql_connector *connector, char *buf, int len);
+int mysql_auth_switch(mysql_connector *connector, char *buf, int len);
 int mysql_request(swString *sql, swString *buffer);
 int mysql_prepare(swString *sql, swString *buffer);
 int mysql_response(mysql_client *client);
+int mysql_is_over(mysql_client *client);
 
 #ifdef SW_MYSQL_DEBUG
 void mysql_client_info(mysql_client *client);
@@ -458,6 +568,8 @@ static sw_inline int mysql_length_coded_binary(char *m, ulong_t *r, char *nul, i
     return retcode;
 }
 
-int mysql_query(zval *zobject, mysql_client *client, swString *sql, zval *callback TSRMLS_DC);
+int mysql_query(zval *zobject, mysql_client *client, swString *sql, zval *callback);
+
+END_EXTERN_C()
 
 #endif /* SWOOLE_MYSQL_H_ */

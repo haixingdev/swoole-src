@@ -1,17 +1,10 @@
 --TEST--
 swoole_http_server: cookies
 --SKIPIF--
-<?php require __DIR__ . "/../include/skipif.inc"; ?>
---INI--
-assert.active=1
-assert.warning=1
-assert.bail=0
-assert.quiet_eval=0
-
+<?php require __DIR__ . '/../include/skipif.inc'; ?>
 --FILE--
 <?php
-require_once __DIR__ . "/../include/swoole.inc";
-require_once __DIR__ . "/../include/lib/curl.php";
+require __DIR__ . '/../include/bootstrap.php';
 
 $cookies = array (
     '8MLP_5753_saltkey' => 'RSU8HYED',

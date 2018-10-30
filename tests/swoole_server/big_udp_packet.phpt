@@ -1,19 +1,13 @@
 --TEST--
 swoole_server: send big udp packet to server
 --SKIPIF--
-<?php require __DIR__ . "/../include/skipif.inc"; ?>
---INI--
-assert.active=1
-assert.warning=1
-assert.bail=0
-assert.quiet_eval=0
-
-
+<?php require __DIR__ . '/../include/skipif.inc'; ?>
 --FILE--
 <?php
+require __DIR__ . '/../include/bootstrap.php';
+
 //最大长度：65535 - UDP包头 8字节 + IP包头 20字节 = 65507
 const N = 65507;
-require_once __DIR__ . "/../include/swoole.inc";
 $port = get_one_free_port();
 
 $pm = new ProcessManager;
@@ -45,7 +39,6 @@ $pm->childFunc = function () use ($pm, $port)
     });
     $serv->start();
 };
-
 
 $pm->childFirst();
 $pm->run();

@@ -2,7 +2,7 @@
 swoole_serialize: Object test, __sleep
 --SKIPIF--
 <?php
-require __DIR__ . "/../include/skipif.inc";
+require __DIR__ . '/../include/skipif.inc';
 if (!class_exists("swoole_serialize", false))
 {
     echo "skip";
@@ -10,13 +10,14 @@ if (!class_exists("swoole_serialize", false))
 ?>
 --FILE--
 <?php
+require __DIR__ . '/../include/bootstrap.php';
 
 function test($type, $variable, $test) {
     $serialized = swoole_serialize::pack($variable);
     $unserialized = swoole_serialize::unpack($serialized);
 
     echo $type, PHP_EOL;
-     
+
     var_dump($unserialized);
     echo $test || $unserialized == $variable ? 'OK' : 'ERROR', PHP_EOL;
 }
@@ -44,7 +45,6 @@ class Obj {
 }
 
 $o = new Obj(1, 2, 3, 4);
-
 
 test('object', $o, true);
 ?>
