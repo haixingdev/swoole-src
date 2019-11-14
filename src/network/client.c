@@ -14,25 +14,23 @@
  +----------------------------------------------------------------------+
  */
 
-#include "swoole.h"
-#include "server.h"
+#include "swoole_api.h"
 #include "client.h"
 #include "socks5.h"
 #include "async.h"
 
-static int swClient_inet_addr(swClient *cli, char *host, int port);
-static int swClient_tcp_connect_sync(swClient *cli, char *host, int port, double _timeout, int udp_connect);
-static int swClient_tcp_connect_async(swClient *cli, char *host, int port, double timeout, int nonblock);
+static int swClient_inet_addr(swClient *cli, const char *host, int port);
+static int swClient_tcp_connect_sync(swClient *cli, const char *host, int port, double _timeout, int udp_connect);
+static int swClient_tcp_connect_async(swClient *cli, const char *host, int port, double timeout, int nonblock);
 
-static int swClient_tcp_send_sync(swClient *cli, char *data, int length, int flags);
-static int swClient_tcp_send_async(swClient *cli, char *data, int length, int flags);
-static int swClient_tcp_pipe(swClient *cli, int write_fd, int flags);
-static int swClient_udp_send(swClient *cli, char *data, int length, int flags);
+static int swClient_tcp_send_sync(swClient *cli, const char *data, int length, int flags);
+static int swClient_tcp_send_async(swClient *cli, const char *data, int length, int flags);
+static int swClient_udp_send(swClient *cli, const char *data, int length, int flags);
 
-static int swClient_tcp_sendfile_sync(swClient *cli, char *filename, off_t offset, size_t length);
-static int swClient_tcp_sendfile_async(swClient *cli, char *filename, off_t offset, size_t length);
+static int swClient_tcp_sendfile_sync(swClient *cli, const char *filename, off_t offset, size_t length);
+static int swClient_tcp_sendfile_async(swClient *cli, const char *filename, off_t offset, size_t length);
 static int swClient_tcp_recv_no_buffer(swClient *cli, char *data, int len, int flags);
-static int swClient_udp_connect(swClient *cli, char *host, int port, double _timeout, int udp_connect);
+static int swClient_udp_connect(swClient *cli, const char *host, int port, double _timeout, int udp_connect);
 static int swClient_udp_recv(swClient *cli, char *data, int len, int waitall);
 static int swClient_close(swClient *cli);
 
@@ -42,16 +40,24 @@ static int swClient_onWrite(swReactor *reactor, swEvent *event);
 static int swClient_onError(swReactor *reactor, swEvent *event);
 static void swClient_onTimeout(swTimer *timer, swTimer_node *tnode);
 static void swClient_onResolveCompleted(swAio_event *event);
-static int swClient_onPackage(swConnection *conn, char *data, uint32_t length);
+static int swClient_onPackage(swProtocol *proto, swSocket *conn, char *data, uint32_t length);
 
 static sw_inline void execute_onConnect(swClient *cli)
 {
     if (cli->timer)
     {
-        swTimer_del(&SwooleG.timer, cli->timer);
+        swoole_timer_del(cli->timer);
         cli->timer = NULL;
     }
     cli->onConnect(cli);
+}
+
+void swClient_init_reactor(swReactor *reactor)
+{
+    swReactor_set_handler(reactor, SW_FD_STREAM_CLIENT | SW_EVENT_READ, swClient_onStreamRead);
+    swReactor_set_handler(reactor, SW_FD_DGRAM_CLIENT | SW_EVENT_READ, swClient_onDgramRead);
+    swReactor_set_handler(reactor, SW_FD_STREAM_CLIENT | SW_EVENT_WRITE, swClient_onWrite);
+    swReactor_set_handler(reactor, SW_FD_STREAM_CLIENT | SW_EVENT_ERROR, swClient_onError);
 }
 
 int swClient_create(swClient *cli, int type, int async)
@@ -97,21 +103,13 @@ int swClient_create(swClient *cli, int type, int async)
 #endif
     if (sockfd < 0)
     {
-        swWarn("socket() failed. Error: %s[%d]", strerror(errno), errno);
+        swSysWarn("socket() failed");
         return SW_ERR;
     }
 
     if (async)
     {
-        if (swIsMaster() && SwooleTG.type == SW_THREAD_REACTOR)
-        {
-            cli->reactor = SwooleTG.reactor;
-        }
-        else
-        {
-            cli->reactor = SwooleG.main_reactor;
-        }
-        cli->socket = swReactor_get(cli->reactor, sockfd);
+        cli->socket = swArray_alloc(SwooleG.socket_array, sockfd);
     }
     else
     {
@@ -122,25 +120,23 @@ int swClient_create(swClient *cli, int type, int async)
 
     if (!cli->socket)
     {
-        swWarn("malloc(%d) failed.", (int ) sizeof(swConnection));
+        swWarn("malloc(%d) failed", (int ) sizeof(swConnection));
         close(sockfd);
         return SW_ERR;
     }
 
-    bzero(cli->socket, sizeof(swConnection));
+    bzero(cli->socket, sizeof(swSocket));
     cli->socket->fd = sockfd;
     cli->socket->object = cli;
 
     if (async)
     {
-        swSetNonBlock(cli->socket->fd);
-        if (!swReactor_handle_isset(cli->reactor, SW_FD_STREAM_CLIENT))
-        {
-            cli->reactor->setHandle(cli->reactor, SW_FD_STREAM_CLIENT | SW_EVENT_READ, swClient_onStreamRead);
-            cli->reactor->setHandle(cli->reactor, SW_FD_DGRAM_CLIENT | SW_EVENT_READ, swClient_onDgramRead);
-            cli->reactor->setHandle(cli->reactor, SW_FD_STREAM_CLIENT | SW_EVENT_WRITE, swClient_onWrite);
-            cli->reactor->setHandle(cli->reactor, SW_FD_STREAM_CLIENT | SW_EVENT_ERROR, swClient_onError);
-        }
+        swSocket_set_nonblock(cli->socket->fd);
+        cli->socket->nonblock = 1;
+    }
+    else
+    {
+        cli->socket->nonblock = 0;
     }
 
     if (swSocket_is_stream(type))
@@ -151,7 +147,6 @@ int swClient_create(swClient *cli, int type, int async)
             cli->connect = swClient_tcp_connect_async;
             cli->send = swClient_tcp_send_async;
             cli->sendfile = swClient_tcp_sendfile_async;
-            cli->pipe = swClient_tcp_pipe;
             cli->socket->dontwait = 1;
         }
         else
@@ -191,11 +186,11 @@ int swClient_sleep(swClient *cli)
     int ret;
     if (cli->socket->events & SW_EVENT_WRITE)
     {
-        ret = cli->reactor->set(cli->reactor, cli->socket->fd, cli->socket->fdtype | SW_EVENT_WRITE);
+        ret = swoole_event_set(cli->socket->fd, SW_EVENT_WRITE, cli->socket->fdtype);
     }
     else
     {
-        ret = cli->reactor->del(cli->reactor, cli->socket->fd);
+        ret = swoole_event_del(cli->socket->fd);
     }
     if (ret == SW_OK)
     {
@@ -209,11 +204,11 @@ int swClient_wakeup(swClient *cli)
     int ret;
     if (cli->socket->events & SW_EVENT_WRITE)
     {
-        ret = cli->reactor->set(cli->reactor, cli->socket->fd, cli->socket->fdtype | SW_EVENT_READ | SW_EVENT_WRITE);
+        ret = swoole_event_set(cli->socket->fd, SW_EVENT_READ | SW_EVENT_WRITE, cli->socket->fdtype);
     }
     else
     {
-        ret = cli->reactor->add(cli->reactor, cli->socket->fd, cli->socket->fdtype | SW_EVENT_READ);
+        ret = swoole_event_add(cli->socket->fd, SW_EVENT_READ, cli->socket->fdtype);
     }
     if (ret == SW_OK)
     {
@@ -224,7 +219,7 @@ int swClient_wakeup(swClient *cli)
 
 int swClient_shutdown(swClient *cli, int __how)
 {
-    if (!cli->socket || cli->socket->closed)
+    if (!cli->socket || cli->closed)
     {
         return SW_ERR;
     }
@@ -335,16 +330,18 @@ int swClient_ssl_verify(swClient *cli, int allow_self_signed)
     {
         return SW_ERR;
     }
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
     if (cli->ssl_option.tls_host_name && swSSL_check_host(cli->socket, cli->ssl_option.tls_host_name) < 0)
     {
         return SW_ERR;
     }
+#endif
     return SW_OK;
 }
 
 #endif
 
-static int swClient_inet_addr(swClient *cli, char *host, int port)
+static int swClient_inet_addr(swClient *cli, const char *host, int port)
 {
     //enable socks5 proxy
     if (cli->socks5_proxy)
@@ -395,7 +392,6 @@ static int swClient_inet_addr(swClient *cli, char *host, int port)
             return SW_OK;
         }
     }
-#ifndef _WIN32
     else if (cli->type == SW_SOCK_UNIX_STREAM || cli->type == SW_SOCK_UNIX_DGRAM)
     {
         cli->server_addr.addr.un.sun_family = AF_UNIX;
@@ -404,7 +400,6 @@ static int swClient_inet_addr(swClient *cli, char *host, int port)
         cli->server_addr.len = sizeof(cli->server_addr.addr.un.sun_path);
         return SW_OK;
     }
-#endif
     else
     {
         return SW_ERR;
@@ -428,7 +423,7 @@ void swClient_free(swClient *cli)
 {
     assert(cli->socket->fd != 0);
     //remove from reactor
-    if (!cli->socket->closed)
+    if (!cli->closed)
     {
         cli->close(cli);
     }
@@ -442,7 +437,7 @@ void swClient_free(swClient *cli)
         swBuffer_free(cli->socket->in_buffer);
         cli->socket->in_buffer = NULL;
     }
-    bzero(cli->socket, sizeof(swConnection));
+    bzero(cli->socket, sizeof(swSocket));
     if (cli->async)
     {
         cli->socket->removed = 1;
@@ -455,11 +450,11 @@ void swClient_free(swClient *cli)
 
 static int swClient_close(swClient *cli)
 {
-    if (cli->socket == NULL || cli->socket->closed)
+    if (cli->socket == NULL || cli->closed)
     {
         return SW_ERR;
     }
-    cli->socket->closed = 1;
+    cli->closed = 1;
 
     int fd = cli->socket->fd;
     assert(fd != 0);
@@ -506,43 +501,40 @@ static int swClient_close(swClient *cli)
         swString_free(cli->buffer);
         cli->buffer = NULL;
     }
-#ifndef _WIN32
     if (cli->type == SW_SOCK_UNIX_DGRAM)
     {
         unlink(cli->socket->info.addr.un.sun_path);
     }
-#endif
     if (cli->async)
     {
         //remove from reactor
-        if (!cli->socket->removed && cli->reactor)
+        if (!cli->socket->removed)
         {
-            cli->reactor->del(cli->reactor, fd);
+            swoole_event_del(fd);
         }
         if (cli->timer)
         {
-            swTimer_del(&SwooleG.timer, cli->timer);
+            swoole_timer_del(cli->timer);
             cli->timer = NULL;
         }
         //onClose callback
-        if (cli->socket->active && cli->onClose)
+        if (cli->active && cli->onClose)
         {
-            cli->socket->active = 0;
+            cli->active = 0;
             cli->onClose(cli);
         }
     }
     else
     {
-        cli->socket->active = 0;
+        cli->active = 0;
     }
 
     return close(fd);
 }
 
-static int swClient_tcp_connect_sync(swClient *cli, char *host, int port, double timeout, int nonblock)
+static int swClient_tcp_connect_sync(swClient *cli, const char *host, int port, double timeout, int nonblock)
 {
     int ret, n;
-    char buf[1024];
 
     cli->timeout = timeout;
 
@@ -551,9 +543,9 @@ static int swClient_tcp_connect_sync(swClient *cli, char *host, int port, double
         return SW_ERR;
     }
 
-    if (nonblock == 1)
+    if (nonblock)
     {
-        swSetNonBlock(cli->socket->fd);
+        swSocket_set_nonblock(cli->socket->fd);
     }
     else
     {
@@ -562,30 +554,38 @@ static int swClient_tcp_connect_sync(swClient *cli, char *host, int port, double
             swSocket_set_timeout(cli->socket->fd, timeout);
         }
 #ifndef HAVE_KQUEUE
-        swSetBlock(cli->socket->fd);
+        swSocket_set_blocking(cli->socket->fd);
 #endif
     }
     while (1)
     {
 #ifdef HAVE_KQUEUE
-    	swSetNonBlock(cli->socket->fd);
-    	ret = connect(cli->socket->fd, (struct sockaddr *) &cli->server_addr.addr, cli->server_addr.len);
-    	if (ret < 0)
-    	{
-    		if (errno != EINPROGRESS)
-    		{
-    			return SW_ERR;
-    		}
-    		if (swSocket_wait(cli->socket->fd, timeout > 0 ? (int) (timeout * 1000) : timeout, SW_EVENT_WRITE) < 0)
-    		{
-    			return SW_ERR;
-    		}
-    		else
-    		{
-    			swSetBlock(cli->socket->fd);
-    			ret = 0;
-    		}
-    	}
+        if (nonblock == 2)
+        {
+            // special case on MacOS
+            ret = connect(cli->socket->fd, (struct sockaddr *) &cli->server_addr.addr, cli->server_addr.len);
+        }
+        else
+        {
+            swSocket_set_nonblock(cli->socket->fd);
+            ret = connect(cli->socket->fd, (struct sockaddr *) &cli->server_addr.addr, cli->server_addr.len);
+            if (ret < 0)
+            {
+                if (errno != EINPROGRESS)
+                {
+                    return SW_ERR;
+                }
+                if (swSocket_wait(cli->socket->fd, timeout > 0 ? (int) (timeout * 1000) : timeout, SW_EVENT_WRITE) < 0)
+                {
+                    return SW_ERR;
+                }
+                else
+                {
+                    swSocket_set_blocking(cli->socket->fd);
+                    ret = 0;
+                }
+            }
+        }
 #else
         ret = connect(cli->socket->fd, (struct sockaddr *) &cli->server_addr.addr, cli->server_addr.len);
 #endif
@@ -601,11 +601,12 @@ static int swClient_tcp_connect_sync(swClient *cli, char *host, int port, double
 
     if (ret >= 0)
     {
-        cli->socket->active = 1;
+        cli->active = 1;
 
         //socks5 proxy
         if (cli->socks5_proxy)
         {
+            char buf[1024];
             swSocks5_pack(buf, cli->socks5_proxy->username == NULL ? 0x00 : 0x02);
             if (cli->send(cli, buf, 3, 0) < 0)
             {
@@ -655,7 +656,7 @@ static int swClient_tcp_connect_sync(swClient *cli, char *host, int port, double
     return ret;
 }
 
-static int swClient_tcp_connect_async(swClient *cli, char *host, int port, double timeout, int nonblock)
+static int swClient_tcp_connect_async(swClient *cli, const char *host, int port, double timeout, int nonblock)
 {
     int ret;
 
@@ -673,7 +674,7 @@ static int swClient_tcp_connect_async(swClient *cli, char *host, int port, doubl
 
     if (!(cli->onConnect && cli->onError && cli->onClose))
     {
-        swWarn("onConnect/onError/onClose callback have not set.");
+        swWarn("onConnect/onError/onClose callback have not set");
         return SW_ERR;
     }
 
@@ -689,11 +690,6 @@ static int swClient_tcp_connect_async(swClient *cli, char *host, int port, doubl
 
     if (cli->wait_dns)
     {
-        if (SwooleAIO.init == 0)
-        {
-            swAio_init();
-        }
-
         swAio_event ev;
         bzero(&ev, sizeof(swAio_event));
 
@@ -710,14 +706,13 @@ static int swClient_tcp_connect_async(swClient *cli, char *host, int port, doubl
         ev.buf = sw_malloc(ev.nbytes);
         if (!ev.buf)
         {
-            swWarn("malloc failed.");
+            swWarn("malloc failed");
             return SW_ERR;
         }
 
         memcpy(ev.buf, cli->server_host, len);
         ((char *) ev.buf)[len] = 0;
         ev.flags = cli->_sock_domain;
-        ev.type = SW_AIO_GETHOSTBYNAME;
         ev.object = cli;
         ev.fd = cli->socket->fd;
         ev.handler = swAio_handler_gethostbyname;
@@ -750,19 +745,19 @@ static int swClient_tcp_connect_async(swClient *cli, char *host, int port, doubl
 
     if ((ret < 0 && errno == EINPROGRESS) || ret == 0)
     {
-        if (cli->reactor->add(cli->reactor, cli->socket->fd, cli->reactor_fdtype | SW_EVENT_WRITE) < 0)
+        if (swoole_event_add(cli->socket->fd, SW_EVENT_WRITE, cli->reactor_fdtype) < 0)
         {
             return SW_ERR;
         }
         if (timeout > 0)
         {
-            cli->timer = swTimer_add(&SwooleG.timer, (int) (timeout * 1000), 0, cli, swClient_onTimeout);
+            cli->timer = swoole_timer_add((long) (timeout * 1000), SW_FALSE, swClient_onTimeout, cli);
         }
         return SW_OK;
     }
     else
     {
-        cli->socket->active = 0;
+        cli->active = 0;
         cli->socket->removed = 1;
         cli->close(cli);
         if (cli->onError)
@@ -774,66 +769,31 @@ static int swClient_tcp_connect_async(swClient *cli, char *host, int port, doubl
     return ret;
 }
 
-static int swClient_tcp_pipe(swClient *cli, int write_fd, int flags)
-{
-    if (!cli->async || cli->_sock_type != SOCK_STREAM)
-    {
-        swWarn("only async tcp-client can use pipe method.");
-        return SW_ERR;
-    }
-
-    int socktype;
-    socklen_t length = sizeof(socktype);
-
-    if (flags & SW_CLIENT_PIPE_TCP_SESSION)
-    {
-        cli->_redirect_to_session = write_fd;
-    }
-    else if (getsockopt(write_fd, SOL_SOCKET, SO_TYPE, &socktype, &length) < 0)
-    {
-        if (errno != ENOTSOCK)
-        {
-            return SW_ERR;
-        }
-        cli->_redirect_to_file = write_fd;
-    }
-    else if (fcntl(write_fd, F_GETFD) != -1 || errno != EBADF)
-    {
-        cli->_redirect_to_socket = write_fd;
-    }
-    else
-    {
-        return SW_ERR;
-    }
-    cli->redirect = 1;
-    return SW_OK;
-}
-
-static int swClient_tcp_send_async(swClient *cli, char *data, int length, int flags)
+static int swClient_tcp_send_async(swClient *cli, const char *data, int length, int flags)
 {
     int n = length;
-    if (cli->reactor->write(cli->reactor, cli->socket->fd, data, length) < 0)
+    if (swoole_event_write(cli->socket->fd, data, length) < 0)
     {
         if (SwooleG.error == SW_ERROR_OUTPUT_BUFFER_OVERFLOW)
         {
             n = -1;
-            cli->socket->high_watermark = 1;
+            cli->high_watermark = 1;
         }
         else
         {
             return SW_ERR;
         }
     }
-    if (cli->onBufferFull && cli->socket->out_buffer && cli->socket->high_watermark == 0
+    if (cli->onBufferFull && cli->socket->out_buffer && cli->high_watermark == 0
             && cli->socket->out_buffer->length >= cli->buffer_high_watermark)
     {
-        cli->socket->high_watermark = 1;
+        cli->high_watermark = 1;
         cli->onBufferFull(cli);
     }
     return n;
 }
 
-static int swClient_tcp_send_sync(swClient *cli, char *data, int length, int flags)
+static int swClient_tcp_send_sync(swClient *cli, const char *data, int length, int flags)
 {
     int written = 0;
     int n;
@@ -867,7 +827,7 @@ static int swClient_tcp_send_sync(swClient *cli, char *data, int length, int fla
     return written;
 }
 
-static int swClient_tcp_sendfile_sync(swClient *cli, char *filename, off_t offset, size_t length)
+static int swClient_tcp_sendfile_sync(swClient *cli, const char *filename, off_t offset, size_t length)
 {
     if (swSocket_sendfile_sync(cli->socket->fd, filename, offset, length, cli->timeout) < 0)
     {
@@ -877,7 +837,7 @@ static int swClient_tcp_sendfile_sync(swClient *cli, char *filename, off_t offse
     return SW_OK;
 }
 
-static int swClient_tcp_sendfile_async(swClient *cli, char *filename, off_t offset, size_t length)
+static int swClient_tcp_sendfile_async(swClient *cli, const char *filename, off_t offset, size_t length)
 {
     if (swConnection_sendfile(cli->socket, filename, offset, length) < 0)
     {
@@ -888,13 +848,11 @@ static int swClient_tcp_sendfile_async(swClient *cli, char *filename, off_t offs
     {
         if (cli->socket->events & SW_EVENT_READ)
         {
-            return cli->reactor->set(cli->reactor, cli->socket->fd,
-                    cli->socket->fdtype | SW_EVENT_READ | SW_EVENT_WRITE);
+            return swoole_event_set(cli->socket->fd, SW_EVENT_READ | SW_EVENT_WRITE, cli->socket->fdtype);
         }
         else
         {
-            return cli->reactor->add(cli->reactor, cli->socket->fd,
-                    cli->socket->fdtype | SW_EVENT_WRITE);
+            return swoole_event_add(cli->socket->fd, SW_EVENT_WRITE, cli->socket->fdtype);
         }
     }
     return SW_OK;
@@ -909,6 +867,13 @@ static int swClient_tcp_recv_no_buffer(swClient *cli, char *data, int len, int f
 
     while (1)
     {
+#ifdef HAVE_KQUEUE
+        int timeout_ms = (int) (cli->timeout * 1000);
+        if (swSocket_wait(cli->socket->fd, timeout_ms, SW_EVENT_READ) < 0)
+        {
+            return -1;
+        }
+#endif
         ret = swConnection_recv(cli->socket, data, len, flag);
         if (ret >= 0)
         {
@@ -919,6 +884,7 @@ static int swClient_tcp_recv_no_buffer(swClient *cli, char *data, int len, int f
             if (cli->interrupt_time <= 0)
             {
                 cli->interrupt_time = swoole_microtime();
+                continue;
             }
             else if (swoole_microtime() > cli->interrupt_time + cli->timeout)
             {
@@ -949,14 +915,14 @@ static int swClient_tcp_recv_no_buffer(swClient *cli, char *data, int len, int f
     return ret;
 }
 
-static int swClient_udp_connect(swClient *cli, char *host, int port, double timeout, int udp_connect)
+static int swClient_udp_connect(swClient *cli, const char *host, int port, double timeout, int udp_connect)
 {
     if (swClient_inet_addr(cli, host, port) < 0)
     {
         return SW_ERR;
     }
 
-    cli->socket->active = 1;
+    cli->active = 1;
     cli->timeout = timeout;
     int bufsize = SwooleG.socket_buffer_size;
 
@@ -965,7 +931,6 @@ static int swClient_udp_connect(swClient *cli, char *host, int port, double time
         swSocket_set_timeout(cli->socket->fd, timeout);
     }
 
-#ifndef _WIN32
     if (cli->type == SW_SOCK_UNIX_DGRAM)
     {
         struct sockaddr_un* client_addr = &cli->socket->info.addr.un;
@@ -975,28 +940,27 @@ static int swClient_udp_connect(swClient *cli, char *host, int port, double time
 
         if (bind(cli->socket->fd, (struct sockaddr *) client_addr, sizeof(cli->socket->info.addr.un)) < 0)
         {
-            swSysError("bind(%s) failed.", client_addr->sun_path);
+            swSysWarn("bind(%s) failed", client_addr->sun_path);
             return SW_ERR;
         }
     }
-#endif
 
     if (udp_connect != 1)
     {
-        goto connect_ok;
+        goto _connect_ok;
     }
 
     if (connect(cli->socket->fd, (struct sockaddr *) (&cli->server_addr), cli->server_addr.len) == 0)
     {
         swSocket_clean(cli->socket->fd);
-        connect_ok:
+        _connect_ok:
 
         setsockopt(cli->socket->fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
         setsockopt(cli->socket->fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
 
         if (cli->async && cli->onConnect)
         {
-            if (cli->reactor->add(cli->reactor, cli->socket->fd, cli->reactor_fdtype | SW_EVENT_READ) < 0)
+            if (swoole_event_add(cli->socket->fd, SW_EVENT_READ, cli->reactor_fdtype) < 0)
             {
                 return SW_ERR;
             }
@@ -1006,7 +970,7 @@ static int swClient_udp_connect(swClient *cli, char *host, int port, double time
     }
     else
     {
-        cli->socket->active = 0;
+        cli->active = 0;
         cli->socket->removed = 1;
         cli->close(cli);
         if (cli->async && cli->onError)
@@ -1017,7 +981,7 @@ static int swClient_udp_connect(swClient *cli, char *host, int port, double time
     }
 }
 
-static int swClient_udp_send(swClient *cli, char *data, int len, int flags)
+static int swClient_udp_send(swClient *cli, const char *data, int len, int flags)
 {
     int n;
     n = sendto(cli->socket->fd, data, len, 0, (struct sockaddr *) &cli->server_addr.addr, cli->server_addr.len);
@@ -1033,6 +997,16 @@ static int swClient_udp_send(swClient *cli, char *data, int len, int flags)
 
 static int swClient_udp_recv(swClient *cli, char *data, int length, int flags)
 {
+#ifdef HAVE_KQUEUE
+    if (!cli->async)
+    {
+        int timeout_ms = (int) (cli->timeout * 1000);
+        if (swSocket_wait(cli->socket->fd, timeout_ms, SW_EVENT_READ) < 0)
+        {
+            return -1;
+        }
+    }
+#endif
     cli->remote_addr.len = sizeof(cli->remote_addr.addr);
     int ret = recvfrom(cli->socket->fd, data, length, flags, (struct sockaddr *) &cli->remote_addr.addr, &cli->remote_addr.len);
     if (ret < 0)
@@ -1112,7 +1086,7 @@ static int swClient_https_proxy_handshake(swClient *cli)
 }
 #endif
 
-static int swClient_onPackage(swConnection *conn, char *data, uint32_t length)
+static int swClient_onPackage(swProtocol *proto, swSocket *conn, char *data, uint32_t length)
 {
     swClient *cli = (swClient *) conn->object;
     cli->onReceive(conn->object, data, length);
@@ -1121,7 +1095,7 @@ static int swClient_onPackage(swConnection *conn, char *data, uint32_t length)
 
 static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
 {
-    int n;
+    ssize_t n;
     swClient *cli = event->socket->object;
     char *buf = cli->buffer->str + cli->buffer->length;
     long buf_size = cli->buffer->size - cli->buffer->length;
@@ -1131,7 +1105,7 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
 #ifdef SW_USE_OPENSSL
         if (cli->open_ssl)
         {
-            int n = swConnection_recv(event->socket, buf, buf_size, 0);
+            n = swConnection_recv(event->socket, buf, buf_size, 0);
             if (n <= 0)
             {
                 goto __close;
@@ -1143,8 +1117,8 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
             }
             if (swClient_https_proxy_handshake(cli) < 0)
             {
-                swoole_error_log(SW_LOG_NOTICE, SW_ERROR_HTTP_PROXY_HANDSHAKE_ERROR, "failed to handshake with http proxy.");
-                goto connect_fail;
+                swoole_error_log(SW_LOG_NOTICE, SW_ERROR_HTTP_PROXY_HANDSHAKE_ERROR, "failed to handshake with http proxy");
+                goto _connect_fail;
             }
             else
             {
@@ -1153,19 +1127,19 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
             }
             if (swClient_enable_ssl_encrypt(cli) < 0)
             {
-                goto connect_fail;
+                goto _connect_fail;
             }
             else
             {
                 if (swClient_ssl_handshake(cli) < 0)
                 {
-                    goto connect_fail;
+                    goto _connect_fail;
                 }
                 else
                 {
                     cli->socket->ssl_state = SW_SSL_STATE_WAIT_STREAM;
                 }
-                return cli->reactor->set(cli->reactor, event->fd, SW_FD_STREAM_CLIENT | SW_EVENT_WRITE);
+                return swoole_event_set(event->fd, SW_EVENT_WRITE, SW_FD_STREAM_CLIENT);
             }
             if (cli->onConnect)
             {
@@ -1195,8 +1169,8 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
         {
             if (swClient_enable_ssl_encrypt(cli) < 0)
             {
-                connect_fail:
-                cli->socket->active = 0;
+                _connect_fail:
+                cli->active = 0;
                 cli->close(cli);
                 if (cli->onError)
                 {
@@ -1207,13 +1181,13 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
             {
                 if (swClient_ssl_handshake(cli) < 0)
                 {
-                    goto connect_fail;
+                    goto _connect_fail;
                 }
                 else
                 {
                     cli->socket->ssl_state = SW_SSL_STATE_WAIT_STREAM;
                 }
-                return cli->reactor->set(cli->reactor, event->fd, SW_FD_STREAM_CLIENT | SW_EVENT_WRITE);
+                return swoole_event_set(event->fd, SW_EVENT_WRITE, SW_FD_STREAM_CLIENT);
             }
         }
         else
@@ -1232,7 +1206,7 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
     {
         if (swClient_ssl_handshake(cli) < 0)
         {
-            goto connect_fail;
+            goto _connect_fail;
         }
         if (cli->socket->ssl_state != SW_SSL_STATE_READY)
         {
@@ -1246,53 +1220,9 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
     }
 #endif
 
-    /**
-     * redirect stream data to other socket
-     */
-    if (cli->redirect)
-    {
-        int ret = 0;
-        n = swConnection_recv(event->socket, buf, buf_size, 0);
-        if (n < 0)
-        {
-            goto __error;
-        }
-        else if (n == 0)
-        {
-            goto __close;
-        }
-        if (cli->_redirect_to_socket)
-        {
-            ret = cli->reactor->write(cli->reactor, cli->_redirect_to_socket, buf, n);
-        }
-        else if (cli->_redirect_to_session)
-        {
-            if (SwooleG.serv->send(SwooleG.serv, cli->_redirect_to_session, buf, n) < 0)
-            {
-                if (SwooleG.error >= SW_ERROR_SESSION_CLOSED_BY_SERVER || SwooleG.error >= SW_ERROR_SESSION_INVALID_ID)
-                {
-                    goto __close;
-                }
-            }
-            else
-            {
-                return SW_OK;
-            }
-        }
-        else
-        {
-            ret = swSocket_write_blocking(cli->_redirect_to_file, buf, n);
-        }
-        if (ret < 0)
-        {
-            goto __error;
-        }
-        return SW_OK;
-    }
-
     if (cli->open_eof_check || cli->open_length_check)
     {
-        swConnection *conn = cli->socket;
+        swSocket *conn = cli->socket;
         swProtocol *protocol = &cli->protocol;
 
         if (cli->open_eof_check)
@@ -1320,16 +1250,15 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
     }
 
 #ifdef SW_CLIENT_RECV_AGAIN
-    recv_again:
+    _recv_again:
 #endif
     n = swConnection_recv(event->socket, buf, buf_size, 0);
     if (n < 0)
     {
-        __error:
         switch (swConnection_error(errno))
         {
         case SW_ERROR:
-            swSysError("Read from socket[%d] failed.", event->fd);
+            swSysWarn("Read from socket[%d] failed", event->fd);
             return SW_OK;
         case SW_CLOSE:
             goto __close;
@@ -1350,7 +1279,7 @@ static int swClient_onStreamRead(swReactor *reactor, swEvent *event)
 #ifdef SW_CLIENT_RECV_AGAIN
         if (n == buf_size)
         {
-            goto recv_again;
+            goto _recv_again;
         }
 #endif
         return SW_OK;
@@ -1378,7 +1307,7 @@ static int swClient_onDgramRead(swReactor *reactor, swEvent *event)
 static int swClient_onError(swReactor *reactor, swEvent *event)
 {
     swClient *cli = event->socket->object;
-    if (cli->socket->active)
+    if (cli->active)
     {
         return cli->close(cli);
     }
@@ -1397,16 +1326,16 @@ static void swClient_onTimeout(swTimer *timer, swTimer_node *tnode)
 #ifdef SW_USE_OPENSSL
     if (cli->open_ssl && cli->socket->ssl_state != SW_SSL_STATE_READY)
     {
-        cli->socket->active = 0;
+        cli->active = 0;
     }
 #endif
     if (cli->socks5_proxy && cli->socks5_proxy->state != SW_SOCKS5_STATE_READY)
     {
-        cli->socket->active = 0;
+        cli->active = 0;
     }
     else if (cli->http_proxy && cli->http_proxy->state != SW_HTTP_PROXY_STATE_READY)
     {
-        cli->socket->active = 0;
+        cli->active = 0;
     }
 
     cli->close(cli);
@@ -1418,7 +1347,7 @@ static void swClient_onTimeout(swTimer *timer, swTimer_node *tnode)
 
 static void swClient_onResolveCompleted(swAio_event *event)
 {
-    swConnection *socket = swReactor_get(SwooleG.main_reactor, event->fd);
+    swSocket *socket = swReactor_get(SwooleTG.reactor, event->fd);
     if (socket->removed)
     {
         sw_free(event->buf);
@@ -1448,38 +1377,38 @@ static void swClient_onResolveCompleted(swAio_event *event)
 static int swClient_onWrite(swReactor *reactor, swEvent *event)
 {
     swClient *cli = event->socket->object;
-    swConnection *_socket = cli->socket;
+    swSocket *_socket = cli->socket;
 
-    if (cli->socket->active)
+    if (cli->active)
     {
 #ifdef SW_USE_OPENSSL
         if (cli->open_ssl && _socket->ssl_state == SW_SSL_STATE_WAIT_STREAM)
         {
             if (swClient_ssl_handshake(cli) < 0)
             {
-                goto connect_fail;
+                goto _connect_fail;
             }
             else if (_socket->ssl_state == SW_SSL_STATE_READY)
             {
-                goto connect_success;
+                goto _connect_success;
             }
             else
             {
                 if (_socket->ssl_want_read)
                 {
-                    cli->reactor->set(cli->reactor, event->fd, SW_FD_STREAM_CLIENT | SW_EVENT_READ);
+                    swoole_event_set(event->fd, SW_EVENT_READ, SW_FD_STREAM_CLIENT);
                 }
                 return SW_OK;
             }
         }
 #endif
-        if (swReactor_onWrite(cli->reactor, event) < 0)
+        if (swReactor_onWrite(reactor, event) < 0)
         {
             return SW_ERR;
         }
-        if (cli->onBufferEmpty && _socket->high_watermark && _socket->out_buffer->length <= cli->buffer_low_watermark)
+        if (cli->onBufferEmpty && cli->high_watermark && _socket->out_buffer->length <= cli->buffer_low_watermark)
         {
-            _socket->high_watermark = 0;
+            cli->high_watermark = 0;
             cli->onBufferEmpty(cli);
         }
         return SW_OK;
@@ -1488,7 +1417,7 @@ static int swClient_onWrite(swReactor *reactor, swEvent *event)
     socklen_t len = sizeof(SwooleG.error);
     if (getsockopt(event->fd, SOL_SOCKET, SO_ERROR, &SwooleG.error, &len) < 0)
     {
-        swWarn("getsockopt(%d) failed. Error: %s[%d]", event->fd, strerror(errno), errno);
+        swSysWarn("getsockopt(%d) failed", event->fd);
         return SW_ERR;
     }
 
@@ -1496,9 +1425,9 @@ static int swClient_onWrite(swReactor *reactor, swEvent *event)
     if (SwooleG.error == 0)
     {
         //listen read event
-        cli->reactor->set(cli->reactor, event->fd, SW_FD_STREAM_CLIENT | SW_EVENT_READ);
+        swoole_event_set(event->fd, SW_EVENT_READ, SW_FD_STREAM_CLIENT);
         //connected
-        _socket->active = 1;
+        cli->active = 1;
         //socks5 proxy
         if (cli->socks5_proxy && cli->socks5_proxy->state == SW_SOCKS5_STATE_WAIT)
         {
@@ -1514,7 +1443,7 @@ static int swClient_onWrite(swReactor *reactor, swEvent *event)
             if (cli->open_ssl)
             {
                 cli->http_proxy->state = SW_HTTP_PROXY_STATE_HANDSHAKE;
-                int n = snprintf(cli->http_proxy->buf, sizeof (cli->http_proxy->buf), "CONNECT %s:%d HTTP/1.1\r\n\r\n", cli->http_proxy->target_host, cli->http_proxy->target_port);
+                int n = sw_snprintf(cli->http_proxy->buf, sizeof (cli->http_proxy->buf), "CONNECT %s:%d HTTP/1.1\r\n\r\n", cli->http_proxy->target_host, cli->http_proxy->target_port);
                 return cli->send(cli, cli->http_proxy->buf, n, 0);
             }
 #endif
@@ -1524,11 +1453,11 @@ static int swClient_onWrite(swReactor *reactor, swEvent *event)
         {
             if (swClient_enable_ssl_encrypt(cli) < 0)
             {
-                goto connect_fail;
+                goto _connect_fail;
             }
             if (swClient_ssl_handshake(cli) < 0)
             {
-                goto connect_fail;
+                goto _connect_fail;
             }
             else
             {
@@ -1536,7 +1465,7 @@ static int swClient_onWrite(swReactor *reactor, swEvent *event)
             }
             return SW_OK;
         }
-        connect_success:
+        _connect_success:
 #endif
         if (cli->onConnect)
         {
@@ -1546,9 +1475,9 @@ static int swClient_onWrite(swReactor *reactor, swEvent *event)
     else
     {
 #ifdef SW_USE_OPENSSL
-        connect_fail:
+        _connect_fail:
 #endif
-        _socket->active = 0;
+        cli->active = 0;
         cli->close(cli);
         if (cli->onError)
         {
@@ -1559,18 +1488,3 @@ static int swClient_onWrite(swReactor *reactor, swEvent *event)
     return SW_OK;
 }
 
-void swoole_open_remote_debug(void)
-{
-    swClient debug_client;
-    swClient_create(&debug_client, SW_SOCK_UDP, 0);
-
-    if (debug_client.connect(&debug_client, SW_DEBUG_SERVER_HOST, SW_DEBUG_SERVER_PORT, -1, 1) < 0)
-    {
-        swWarn("connect to remote_debug_server[%s:%d] failed.", SW_DEBUG_SERVER_HOST, SW_DEBUG_SERVER_PORT);
-        SwooleG.debug_fd = 1;
-    }
-    else
-    {
-        SwooleG.debug_fd = debug_client.socket->fd;
-    }
-}

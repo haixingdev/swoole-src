@@ -1,7 +1,9 @@
 --TEST--
 swoole_http_client_coro: http client with HEAD method
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc';
+skip_if_offline();
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
@@ -12,9 +14,8 @@ Swoole\Coroutine::create(function ()
     $cli->set(['timeout' => 10]);
     $cli->setMethod('HEAD');
     $cli->get('/');
-    assert($cli->statusCode == 200);
-    assert(count($cli->headers) > 0);
+    Assert::same($cli->statusCode, 200);
+    Assert::assert(count($cli->headers) > 0);
 });
 ?>
 --EXPECT--
-

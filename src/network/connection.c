@@ -16,7 +16,6 @@
  +----------------------------------------------------------------------+
  */
 
-#include "swoole.h"
 #include "server.h"
 
 #include <sys/stat.h>
@@ -25,7 +24,7 @@
 #define MSG_NOSIGNAL        0
 #endif
 
-int swConnection_onSendfile(swConnection *conn, swBuffer_chunk *chunk)
+int swConnection_onSendfile(swSocket *conn, swBuffer_chunk *chunk)
 {
     int ret;
     swTask_sendfile *task = chunk->store.ptr;
@@ -39,9 +38,9 @@ int swConnection_onSendfile(swConnection *conn, swBuffer_chunk *chunk)
         if (conn->tcp_nodelay)
         {
             int tcp_nodelay = 0;
-            if (setsockopt(conn->fd, IPPROTO_TCP, TCP_NODELAY, (const void *) &tcp_nodelay, sizeof(int)) == -1)
+            if (setsockopt(conn->fd, IPPROTO_TCP, TCP_NODELAY, (const void *) &tcp_nodelay, sizeof(int)) != 0)
             {
-                swWarn("setsockopt(TCP_NODELAY) failed. Error: %s[%d]", strerror(errno), errno);
+                swSysWarn("setsockopt(TCP_NODELAY) failed");
             }
         }
         /**
@@ -49,7 +48,7 @@ int swConnection_onSendfile(swConnection *conn, swBuffer_chunk *chunk)
          */
         if (swSocket_tcp_nopush(conn->fd, 1) == -1)
         {
-            swWarn("swSocket_tcp_nopush() failed. Error: %s[%d]", strerror(errno), errno);
+            swSysWarn("swSocket_tcp_nopush() failed");
         }
         conn->tcp_nopush = 1;
     }
@@ -75,7 +74,7 @@ int swConnection_onSendfile(swConnection *conn, swBuffer_chunk *chunk)
         switch (swConnection_error(errno))
         {
         case SW_ERROR:
-            swSysError("sendfile(%s, %ld, %d) failed.", task->filename, (long)task->offset, sendn);
+            swSysWarn("sendfile(%s, %ld, %d) failed", task->filename, (long)task->offset, sendn);
             swBuffer_pop_chunk(conn->out_buffer, chunk);
             return SW_OK;
         case SW_CLOSE:
@@ -100,7 +99,7 @@ int swConnection_onSendfile(swConnection *conn, swBuffer_chunk *chunk)
          */
         if (swSocket_tcp_nopush(conn->fd, 0) == -1)
         {
-            swWarn("swSocket_tcp_nopush() failed. Error: %s[%d]", strerror(errno), errno);
+            swSysWarn("swSocket_tcp_nopush() failed");
         }
         conn->tcp_nopush = 0;
 
@@ -110,9 +109,9 @@ int swConnection_onSendfile(swConnection *conn, swBuffer_chunk *chunk)
         if (conn->tcp_nodelay)
         {
             int value = 1;
-            if (setsockopt(conn->fd, IPPROTO_TCP, TCP_NODELAY, (const void *) &value, sizeof(int)) == -1)
+            if (setsockopt(conn->fd, IPPROTO_TCP, TCP_NODELAY, (const void *) &value, sizeof(int)) != 0)
             {
-                swWarn("setsockopt(TCP_NODELAY) failed. Error: %s[%d]", strerror(errno), errno);
+                swSysWarn("setsockopt(TCP_NODELAY) failed");
             }
         }
 #endif
@@ -123,7 +122,7 @@ int swConnection_onSendfile(swConnection *conn, swBuffer_chunk *chunk)
 /**
  * send buffer to client
  */
-int swConnection_buffer_send(swConnection *conn)
+int swConnection_buffer_send(swSocket *conn)
 {
     int ret, sendn;
 
@@ -143,10 +142,9 @@ int swConnection_buffer_send(swConnection *conn)
         switch (swConnection_error(errno))
         {
         case SW_ERROR:
-            swWarn("send to fd[%d] failed. Error: %s[%d]", conn->fd, strerror(errno), errno);
+            swSysWarn("send to fd[%d] failed", conn->fd);
             break;
         case SW_CLOSE:
-            conn->close_errno = errno;
             conn->close_wait = 1;
             return SW_ERR;
         case SW_WAIT:
@@ -169,52 +167,37 @@ int swConnection_buffer_send(swConnection *conn)
     return SW_OK;
 }
 
-swString* swConnection_get_string_buffer(swConnection *conn)
-{
-    swString *buffer = conn->object;
-    if (buffer == NULL)
-    {
-        return swString_new(SW_BUFFER_SIZE);
-    }
-    else
-    {
-        return buffer;
-    }
-}
-
 static char tmp_address[INET6_ADDRSTRLEN];
 
-char* swConnection_get_ip(swConnection *conn)
+const char* swConnection_get_ip(enum swSocket_type socket_type, swSocketAddress *info)
 {
-    if (conn->socket_type == SW_SOCK_TCP || conn->socket_type == SW_SOCK_UDP)
+    if (socket_type == SW_SOCK_TCP || socket_type == SW_SOCK_UDP)
     {
-        return inet_ntoa(conn->info.addr.inet_v4.sin_addr);
+        return inet_ntoa(info->addr.inet_v4.sin_addr);
     }
-    else if (conn->socket_type == SW_SOCK_TCP6 || conn->socket_type == SW_SOCK_UDP6)
+    else if (socket_type == SW_SOCK_TCP6 || socket_type == SW_SOCK_UDP6)
     {
-        if (inet_ntop(AF_INET6, &conn->info.addr.inet_v6.sin6_addr, tmp_address, sizeof(tmp_address)))
+        if (inet_ntop(AF_INET6, &info->addr.inet_v6.sin6_addr, tmp_address, sizeof(tmp_address)))
         {
             return tmp_address;
         }
     }
-#ifndef _WIN32
-    else if (conn->socket_type == SW_SOCK_UNIX_STREAM || conn->socket_type == SW_SOCK_UNIX_DGRAM)
+    else if (socket_type == SW_SOCK_UNIX_STREAM || socket_type == SW_SOCK_UNIX_DGRAM)
     {
-        return conn->info.addr.un.sun_path;
+        return info->addr.un.sun_path;
     }
-#endif
     return "unknown";
 }
 
-int swConnection_get_port(swConnection *conn)
+int swConnection_get_port(enum swSocket_type socket_type, swSocketAddress *info)
 {
-    if (conn->socket_type == SW_SOCK_TCP)
+    if (socket_type == SW_SOCK_TCP)
     {
-        return ntohs(conn->info.addr.inet_v4.sin_port);
+        return ntohs(info->addr.inet_v4.sin_port);
     }
     else
     {
-        return ntohs(conn->info.addr.inet_v6.sin6_port);
+        return ntohs(info->addr.inet_v6.sin6_port);
     }
 }
 
@@ -226,11 +209,11 @@ void swConnection_sendfile_destructor(swBuffer_chunk *chunk)
     sw_free(task);
 }
 
-int swConnection_sendfile(swConnection *conn, char *filename, off_t offset, size_t length)
+int swConnection_sendfile(swSocket *conn, const char *filename, off_t offset, size_t length)
 {
     if (conn->out_buffer == NULL)
     {
-        conn->out_buffer = swBuffer_new(SW_BUFFER_SIZE);
+        conn->out_buffer = swBuffer_new(SW_SEND_BUFFER_SIZE);
         if (conn->out_buffer == NULL)
         {
             return SW_ERR;
@@ -241,7 +224,7 @@ int swConnection_sendfile(swConnection *conn, char *filename, off_t offset, size
     swTask_sendfile *task = sw_malloc(sizeof(swTask_sendfile));
     if (task == NULL)
     {
-        swWarn("malloc for swTask_sendfile failed.");
+        swWarn("malloc for swTask_sendfile failed");
         return SW_ERR;
     }
     bzero(task, sizeof(swTask_sendfile));
@@ -252,7 +235,7 @@ int swConnection_sendfile(swConnection *conn, char *filename, off_t offset, size
     {
         sw_free(task->filename);
         sw_free(task);
-        swSysError("open(%s) failed.", filename);
+        swSysWarn("open(%s) failed", filename);
         return SW_OK;
     }
     task->fd = file_fd;
@@ -261,14 +244,14 @@ int swConnection_sendfile(swConnection *conn, char *filename, off_t offset, size
     struct stat file_stat;
     if (fstat(file_fd, &file_stat) < 0)
     {
-        swSysError("fstat(%s) failed.", filename);
+        swSysWarn("fstat(%s) failed", filename);
         error_chunk.store.ptr = task;
         swConnection_sendfile_destructor(&error_chunk);
         return SW_ERR;
     }
     if (offset < 0 || (length + offset > file_stat.st_size))
     {
-        swoole_error_log(SW_LOG_WARNING, SW_ERROR_INVALID_PARAMS, "length or offset is invalid.");
+        swoole_error_log(SW_LOG_WARNING, SW_ERROR_INVALID_PARAMS, "length or offset is invalid");
         error_chunk.store.ptr = task;
         swConnection_sendfile_destructor(&error_chunk);
         return SW_OK;
@@ -285,7 +268,7 @@ int swConnection_sendfile(swConnection *conn, char *filename, off_t offset, size
     swBuffer_chunk *chunk = swBuffer_new_chunk(conn->out_buffer, SW_CHUNK_SENDFILE, 0);
     if (chunk == NULL)
     {
-        swWarn("get out_buffer chunk failed.");
+        swWarn("get out_buffer chunk failed");
         error_chunk.store.ptr = task;
         swConnection_sendfile_destructor(&error_chunk);
         return SW_ERR;
@@ -297,73 +280,3 @@ int swConnection_sendfile(swConnection *conn, char *filename, off_t offset, size
     return SW_OK;
 }
 
-
-void swConnection_clear_string_buffer(swConnection *conn)
-{
-    swString *buffer = conn->object;
-    if (buffer != NULL)
-    {
-        swString_free(buffer);
-        conn->object = NULL;
-    }
-}
-
-swBuffer_chunk* swConnection_get_in_buffer(swConnection *conn)
-{
-    swBuffer_chunk *chunk = NULL;
-    swBuffer *buffer;
-
-    if (conn->in_buffer == NULL)
-    {
-        buffer = swBuffer_new(SW_BUFFER_SIZE);
-        //buffer create failed
-        if (buffer == NULL)
-        {
-            return NULL;
-        }
-        //new chunk
-        chunk = swBuffer_new_chunk(buffer, SW_CHUNK_DATA, buffer->chunk_size);
-        if (chunk == NULL)
-        {
-            sw_free(buffer);
-            return NULL;
-        }
-        conn->in_buffer = buffer;
-    }
-    else
-    {
-        buffer = conn->in_buffer;
-        chunk = buffer->tail;
-        if (chunk == NULL || chunk->length == buffer->chunk_size)
-        {
-            chunk = swBuffer_new_chunk(buffer, SW_CHUNK_DATA, buffer->chunk_size);
-        }
-    }
-    return chunk;
-}
-
-swBuffer_chunk* swConnection_get_out_buffer(swConnection *conn, uint32_t type)
-{
-    swBuffer_chunk *chunk;
-    if (conn->out_buffer == NULL)
-    {
-        conn->out_buffer = swBuffer_new(SW_BUFFER_SIZE);
-        if (conn->out_buffer == NULL)
-        {
-            return NULL;
-        }
-    }
-    if (type == SW_CHUNK_SENDFILE)
-    {
-        chunk = swBuffer_new_chunk(conn->out_buffer, SW_CHUNK_SENDFILE, 0);
-    }
-    else
-    {
-        chunk = swBuffer_get_chunk(conn->out_buffer);
-        if (chunk == NULL)
-        {
-            chunk = swBuffer_new_chunk(conn->out_buffer, SW_CHUNK_DATA, conn->out_buffer->chunk_size);
-        }
-    }
-    return chunk;
-}

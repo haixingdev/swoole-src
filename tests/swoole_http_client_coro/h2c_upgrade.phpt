@@ -1,13 +1,15 @@
 --TEST--
 swoole_http_client_coro: upgrade bug
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc';
+skip_if_offline();
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 go(function () {
     $host = 'www.imiphp.com';
-    $cli = new Swoole\Coroutine\Http\Client($host, 80);
+    $cli = new Swoole\Coroutine\Http\Client($host, 443, true);
     $cli->set(['timeout' => 10]);
     $cli->setHeaders([
         'host' => $host, // wrong case auto fix
@@ -17,8 +19,8 @@ go(function () {
         'Accept-Encoding' => 'gzip',
     ]);
     $ret = $cli->get('/');
-    assert($ret);
-    assert(strpos($cli->body, 'Swoole') !== false);
+    Assert::assert($ret);
+    Assert::assert(strpos($cli->body, 'Swoole') !== false);
 });
 ?>
 --EXPECT--

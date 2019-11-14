@@ -4,6 +4,7 @@ swoole_http_client_coro: long domain
 <?php
 require __DIR__ . '/../include/skipif.inc';
 skip_if_in_travis('travis network');
+skip_if_offline();
 ?>
 --FILE--
 <?php
@@ -21,9 +22,9 @@ function http_get(string $url)
         'Accept' => 'text/html,application/xhtml+xml,application/xml',
         'Accept-Encoding' => 'gzip'
     ]);
-    assert($cli->get('/'));
-    assert($cli->statusCode === 200);
-    assert(!empty($cli->body));
+    Assert::assert($cli->get('/'));
+    Assert::same($cli->statusCode, 200);
+    Assert::assert(!empty($cli->body));
 }
 
 go(function () {
@@ -37,4 +38,3 @@ go(function () {
 });
 ?>
 --EXPECT--
-

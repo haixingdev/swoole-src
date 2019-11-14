@@ -21,16 +21,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 
-#ifdef __sun
-#include <fcntl.h>
-#define LOCK_SH             F_RDLCK
-#define LOCK_EX             F_WRLCK
-#define LOCK_UN             F_UNLCK
-struct flock lock;
-#define flock(fildes, cmd) \
-    lock.l_type = (cmd), fcntl(fildes, F_SETLK, &lock)
-#endif
-
+#if 0
 swAsyncIO SwooleAIO;
 
 static int swAio_onTask(swThreadPool *pool, void *task, int task_len);
@@ -48,7 +39,7 @@ int swAio_init(void)
         swWarn("AIO has already been initialized");
         return SW_ERR;
     }
-    if (!SwooleG.main_reactor)
+    if (!SwooleTG.reactor)
     {
         swWarn("No eventloop, cannot initialized");
         return SW_ERR;
@@ -59,7 +50,7 @@ int swAio_init(void)
     }
     if (swMutex_create(&SwooleAIO.lock, 0) < 0)
     {
-        swWarn("create mutex lock error.");
+        swWarn("create mutex lock error");
         return SW_ERR;
     }
     if (SwooleAIO.thread_num <= 0)
@@ -76,8 +67,8 @@ int swAio_init(void)
     _pipe_read = _aio_pipe.getFd(&_aio_pipe, 0);
     _pipe_write = _aio_pipe.getFd(&_aio_pipe, 1);
 
-    SwooleG.main_reactor->setHandle(SwooleG.main_reactor, SW_FD_AIO, swAio_onCompleted);
-    SwooleG.main_reactor->add(SwooleG.main_reactor, _pipe_read, SW_FD_AIO);
+    SwooleTG.reactor->setHandle(SwooleTG.reactor, SW_FD_AIO, swAio_onCompleted);
+    swoole_event_add(_pipe_read, SW_FD_AIO);
 
     if (swThreadPool_run(&pool) < 0)
     {
@@ -89,70 +80,6 @@ int swAio_init(void)
     return SW_OK;
 }
 
-void swAio_free(void)
-{
-    if (!SwooleAIO.init)
-    {
-        return;
-    }
-    swThreadPool_free(&pool);
-    if (SwooleG.main_reactor)
-    {
-        SwooleG.main_reactor->del(SwooleG.main_reactor, _pipe_read);
-    }
-    _aio_pipe.close(&_aio_pipe);
-    SwooleAIO.init = 0;
-}
-
-#ifndef HAVE_DAEMON
-int daemon(int nochdir, int noclose)
-{
-    pid_t pid;
-
-    if (!nochdir && chdir("/") != 0)
-    {
-        swWarn("chdir() failed. Error: %s[%d]", strerror(errno), errno);
-        return -1;
-    }
-
-    if (!noclose)
-    {
-        int fd = open("/dev/null", O_RDWR);
-        if (fd < 0)
-        {
-            swWarn("open() failed. Error: %s[%d]", strerror(errno), errno);
-            return -1;
-        }
-
-        if (dup2(fd, 0) < 0 || dup2(fd, 1) < 0 || dup2(fd, 2) < 0)
-        {
-            close(fd);
-            swWarn("dup2() failed. Error: %s[%d]", strerror(errno), errno);
-            return -1;
-        }
-
-        close(fd);
-    }
-
-    pid = fork();
-    if (pid < 0)
-    {
-        swWarn("fork() failed. Error: %s[%d]", strerror(errno), errno);
-        return -1;
-    }
-    if (pid > 0)
-    {
-        _exit(0);
-    }
-    if (setsid() < 0)
-    {
-        swWarn("setsid() failed. Error: %s[%d]", strerror(errno), errno);
-        return -1;
-    }
-    return 0;
-}
-#endif
-
 static int swAio_onCompleted(swReactor *reactor, swEvent *event)
 {
     int i;
@@ -160,7 +87,7 @@ static int swAio_onCompleted(swReactor *reactor, swEvent *event)
     int n = read(event->fd, events, sizeof(swAio_event*) * SW_AIO_EVENT_NUM);
     if (n < 0)
     {
-        swWarn("read() failed. Error: %s[%d]", strerror(errno), errno);
+        swSysWarn("read() failed");
         return SW_ERR;
     }
     for (i = 0; i < n / sizeof(swAio_event*); i++)
@@ -172,12 +99,146 @@ static int swAio_onCompleted(swReactor *reactor, swEvent *event)
     return SW_OK;
 }
 
+
+static int swAio_onTask(swThreadPool *pool, void *task, int task_len)
+{
+    swAio_event *event = task;
+    if (event->handler == NULL)
+    {
+        event->error = SW_ERROR_AIO_BAD_REQUEST;
+        event->ret = -1;
+        goto _error;
+    }
+
+    event->handler(event);
+
+    swTrace("aio_thread ok. ret=%d, error=%d", event->ret, event->error);
+
+    _error:
+    do
+    {
+        SwooleAIO.lock.lock(&SwooleAIO.lock);
+        int ret = write(_pipe_write, &task, sizeof(task));
+        SwooleAIO.lock.unlock(&SwooleAIO.lock);
+        if (ret < 0)
+        {
+            if (errno == EAGAIN)
+            {
+                swYield();
+                continue;
+            }
+            else if (errno == EINTR)
+            {
+                continue;
+            }
+            else
+            {
+                swSysWarn("sendto swoole_aio_pipe_write failed");
+            }
+        }
+        break;
+    } while (1);
+
+    return SW_OK;
+}
+
+int swAio_dispatch(swAio_event *_event)
+{
+    if (SwooleAIO.init == 0)
+    {
+        swAio_init();
+    }
+
+    _event->task_id = SwooleAIO.current_id++;
+
+    swAio_event *event = (swAio_event *) sw_malloc(sizeof(swAio_event));
+    if (event == NULL)
+    {
+        swWarn("malloc failed");
+        return SW_ERR;
+    }
+    memcpy(event, _event, sizeof(swAio_event));
+
+    if (swThreadPool_dispatch(&pool, event, sizeof(event)) < 0)
+    {
+        return SW_ERR;
+    }
+    else
+    {
+        SwooleAIO.task_num++;
+        return _event->task_id;
+    }
+}
+
+void swAio_free(void)
+{
+    if (!SwooleAIO.init)
+    {
+        return;
+    }
+    swThreadPool_free(&pool);
+    if (SwooleTG.reactor)
+    {
+        SwooleTG.reactor->del(SwooleTG.reactor, _pipe_read);
+    }
+    _aio_pipe.close(&_aio_pipe);
+    SwooleAIO.init = 0;
+}
+#endif
+
+int swoole_daemon(int nochdir, int noclose)
+{
+    pid_t pid;
+
+    if (!nochdir && chdir("/") != 0)
+    {
+        swSysWarn("chdir() failed");
+        return -1;
+    }
+
+    if (!noclose)
+    {
+        int fd = open("/dev/null", O_RDWR);
+        if (fd < 0)
+        {
+            swSysWarn("open() failed");
+            return -1;
+        }
+
+        if (dup2(fd, 0) < 0 || dup2(fd, 1) < 0 || dup2(fd, 2) < 0)
+        {
+            close(fd);
+            swSysWarn("dup2() failed");
+            return -1;
+        }
+
+        close(fd);
+    }
+
+    pid = fork();
+    if (pid < 0)
+    {
+        swSysWarn("fork() failed");
+        return -1;
+    }
+    if (pid > 0)
+    {
+        _exit(0);
+    }
+    if (setsid() < 0)
+    {
+        swSysWarn("setsid() failed");
+        return -1;
+    }
+    return 0;
+}
+
 void swAio_handler_read(swAio_event *event)
 {
     int ret = -1;
     if (event->lock && flock(event->fd, LOCK_SH) < 0)
     {
-        swSysError("flock(%d, LOCK_SH) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_SH) failed", event->fd);
         event->ret = -1;
         event->error = errno;
         return;
@@ -193,7 +254,7 @@ void swAio_handler_read(swAio_event *event)
     }
     if (event->lock && flock(event->fd, LOCK_UN) < 0)
     {
-        swSysError("flock(%d, LOCK_UN) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_UN) failed", event->fd);
     }
     if (ret < 0)
     {
@@ -202,120 +263,29 @@ void swAio_handler_read(swAio_event *event)
     event->ret = ret;
 }
 
-static inline char* find_eol(char *buf, size_t size)
+void swAio_handler_fgets(swAio_event *event)
 {
-    char *eol = memchr(buf, '\n', size);
-    if (!eol)
-    {
-        eol = memchr(buf, '\r', size);
-    }
-    return eol;
-}
-
-void swAio_handler_stream_get_line(swAio_event *event)
-{
-    int ret = -1;
     if (event->lock && flock(event->fd, LOCK_SH) < 0)
     {
-        swSysError("flock(%d, LOCK_SH) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_SH) failed", event->fd);
         event->ret = -1;
         event->error = errno;
         return;
     }
 
-    off_t readpos = event->offset;
-    off_t writepos = (long) event->req;
-    size_t avail = 0;
-    char *eol;
-    char *tmp;
-
-    char *read_buf = event->buf;
-    int read_n = event->nbytes;
-
-    while (1)
+    FILE *file = (FILE *) event->req;
+    char *data = fgets(event->buf, event->nbytes, file);
+    if (data == NULL)
     {
-        avail = writepos - readpos;
-
-        swTraceLog(SW_TRACE_AIO, "readpos=%ld, writepos=%ld", (long)readpos, (long)writepos);
-
-        if (avail > 0)
-        {
-            tmp = event->buf + readpos;
-            eol = find_eol(tmp, avail);
-            if (eol)
-            {
-                event->buf = tmp;
-                event->ret = (eol - tmp) + 1;
-                readpos += event->ret;
-                goto _return;
-            }
-            else if (readpos == 0)
-            {
-                if (writepos == event->nbytes)
-                {
-                    writepos = 0;
-                    event->ret = event->nbytes;
-                    goto _return;
-                }
-                else
-                {
-                    event->flags = SW_AIO_EOF;
-                    ((char*) event->buf)[writepos] = '\0';
-                    event->ret = writepos;
-                    writepos = 0;
-                    goto _return;
-                }
-            }
-            else
-            {
-                memmove(event->buf, event->buf + readpos, avail);
-                writepos = avail;
-                read_buf = event->buf + writepos;
-                read_n = event->nbytes - writepos;
-                readpos = 0;
-                goto _readfile;
-            }
-        }
-        else
-        {
-            _readfile: while (1)
-            {
-                ret = read(event->fd, read_buf, read_n);
-                if (ret < 0 && (errno == EINTR || errno == EAGAIN))
-                {
-                    continue;
-                }
-                break;
-            }
-            if (ret > 0)
-            {
-                writepos += ret;
-            }
-            else if (ret == 0)
-            {
-                event->flags = SW_AIO_EOF;
-                if (writepos > 0)
-                {
-                    event->ret = writepos;
-                }
-                else
-                {
-                    ((char*) event->buf)[0] = '\0';
-                    event->ret = 0;
-                }
-                readpos = writepos = 0;
-                goto _return;
-            }
-        }
+        event->ret = -1;
+        event->error = errno;
+        event->flags = SW_AIO_EOF;
     }
 
-    _return:
     if (event->lock && flock(event->fd, LOCK_UN) < 0)
     {
-        swSysError("flock(%d, LOCK_UN) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_UN) failed", event->fd);
     }
-    event->offset = readpos;
-    event->req = (void *) (long) writepos;
 }
 
 void swAio_handler_read_file(swAio_event *event)
@@ -324,7 +294,7 @@ void swAio_handler_read_file(swAio_event *event)
     int fd = open(event->req, O_RDONLY);
     if (fd < 0)
     {
-        swSysError("open(%s, O_RDONLY) failed.", (char * )event->req);
+        swSysWarn("open(%s, O_RDONLY) failed", (char * )event->req);
         event->ret = ret;
         event->error = errno;
         return;
@@ -332,8 +302,9 @@ void swAio_handler_read_file(swAio_event *event)
     struct stat file_stat;
     if (fstat(fd, &file_stat) < 0)
     {
-        swSysError("fstat(%s) failed.", (char * )event->req);
-        _error: close(fd);
+        swSysWarn("fstat(%s) failed", (char * )event->req);
+        _error:
+        close(fd);
         event->ret = ret;
         event->error = errno;
         return;
@@ -349,7 +320,7 @@ void swAio_handler_read_file(swAio_event *event)
      */
     if (event->lock && flock(fd, LOCK_SH) < 0)
     {
-        swSysError("flock(%d, LOCK_SH) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_SH) failed", event->fd);
         goto _error;
     }
     /**
@@ -373,7 +344,7 @@ void swAio_handler_read_file(swAio_event *event)
         {
             goto _error;
         }
-        int readn = swoole_sync_readfile(fd, event->buf, (int) file_stat.st_size);
+        size_t readn = swoole_sync_readfile(fd, event->buf, file_stat.st_size);
         event->ret = readn;
     }
     /**
@@ -381,7 +352,7 @@ void swAio_handler_read_file(swAio_event *event)
      */
     if (event->lock && flock(fd, LOCK_UN) < 0)
     {
-        swSysError("flock(%d, LOCK_UN) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_UN) failed", event->fd);
     }
     close(fd);
     event->error = 0;
@@ -393,30 +364,30 @@ void swAio_handler_write_file(swAio_event *event)
     int fd = open(event->req, event->flags, 0644);
     if (fd < 0)
     {
-        swSysError("open(%s, %d) failed.", (char * )event->req, event->flags);
+        swSysWarn("open(%s, %d) failed", (char * )event->req, event->flags);
         event->ret = ret;
         event->error = errno;
         return;
     }
     if (event->lock && flock(fd, LOCK_EX) < 0)
     {
-        swSysError("flock(%d, LOCK_EX) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_EX) failed", event->fd);
         event->ret = ret;
         event->error = errno;
         close(fd);
         return;
     }
-    int written = swoole_sync_writefile(fd, event->buf, event->nbytes);
+    size_t written = swoole_sync_writefile(fd, event->buf, event->nbytes);
     if (event->flags & SW_AIO_WRITE_FSYNC)
     {
         if (fsync(fd) < 0)
         {
-            swSysError("fsync(%d) failed.", event->fd);
+            swSysWarn("fsync(%d) failed", event->fd);
         }
     }
     if (event->lock && flock(fd, LOCK_UN) < 0)
     {
-        swSysError("flock(%d, LOCK_UN) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_UN) failed", event->fd);
     }
     close(fd);
     event->ret = written;
@@ -428,7 +399,7 @@ void swAio_handler_write(swAio_event *event)
     int ret = -1;
     if (event->lock && flock(event->fd, LOCK_EX) < 0)
     {
-        swSysError("flock(%d, LOCK_EX) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_EX) failed", event->fd);
         return;
     }
     if (event->offset == 0)
@@ -443,12 +414,12 @@ void swAio_handler_write(swAio_event *event)
     {
         if (fsync(event->fd) < 0)
         {
-            swSysError("fsync(%d) failed.", event->fd);
+            swSysWarn("fsync(%d) failed", event->fd);
         }
     }
     if (event->lock && flock(event->fd, LOCK_UN) < 0)
     {
-        swSysError("flock(%d, LOCK_UN) failed.", event->fd);
+        swSysWarn("flock(%d, LOCK_UN) failed", event->fd);
     }
     if (ret < 0)
     {
@@ -464,7 +435,7 @@ void swAio_handler_gethostbyname(swAio_event *event)
     int ret;
 
 #ifndef HAVE_GETHOSTBYNAME2_R
-    SwooleAIO.lock.lock(&SwooleAIO.lock);
+    SwooleG.lock.lock(&SwooleG.lock);
 #endif
     if (event->flags == AF_INET6)
     {
@@ -476,12 +447,12 @@ void swAio_handler_gethostbyname(swAio_event *event)
     }
     bzero(event->buf, event->nbytes);
 #ifndef HAVE_GETHOSTBYNAME2_R
-    SwooleAIO.lock.unlock(&SwooleAIO.lock);
+    SwooleG.lock.unlock(&SwooleG.lock);
 #endif
 
     if (ret < 0)
     {
-        event->error = h_errno;
+        event->error = SW_ERROR_DNSLOOKUP_RESOLVE_FAILED;
     }
     else
     {
@@ -507,71 +478,3 @@ void swAio_handler_getaddrinfo(swAio_event *event)
     event->error = req->error;
 }
 
-static int swAio_onTask(swThreadPool *pool, void *task, int task_len)
-{
-    swAio_event *event = task;
-    if (event->handler == NULL)
-    {
-        event->error = SW_ERROR_AIO_BAD_REQUEST;
-        event->ret = -1;
-        goto _error;
-    }
-
-    event->handler(event);
-
-    swTrace("aio_thread ok. ret=%d, error=%d", event->ret, event->error);
-
-    _error: do
-    {
-        SwooleAIO.lock.lock(&SwooleAIO.lock);
-        int ret = write(_pipe_write, &task, sizeof(task));
-        SwooleAIO.lock.unlock(&SwooleAIO.lock);
-        if (ret < 0)
-        {
-            if (errno == EAGAIN)
-            {
-                swYield();
-                continue;
-            }
-            else if (errno == EINTR)
-            {
-                continue;
-            }
-            else
-            {
-                swSysError("sendto swoole_aio_pipe_write failed.");
-            }
-        }
-        break;
-    } while (1);
-
-    return SW_OK;
-}
-
-int swAio_dispatch(swAio_event *_event)
-{
-    if (SwooleAIO.init == 0)
-    {
-        swAio_init();
-    }
-
-    _event->task_id = SwooleAIO.current_id++;
-
-    swAio_event *event = (swAio_event *) sw_malloc(sizeof(swAio_event));
-    if (event == NULL)
-    {
-        swWarn("malloc failed.");
-        return SW_ERR;
-    }
-    memcpy(event, _event, sizeof(swAio_event));
-
-    if (swThreadPool_dispatch(&pool, event, sizeof(event)) < 0)
-    {
-        return SW_ERR;
-    }
-    else
-    {
-        SwooleAIO.task_num++;
-        return _event->task_id;
-    }
-}

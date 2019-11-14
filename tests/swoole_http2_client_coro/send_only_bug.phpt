@@ -1,7 +1,9 @@
 --TEST--
 swoole_http2_client_coro: send only without recv and use sleep
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc';
+skip_if_offline();
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
@@ -13,7 +15,7 @@ go(function () {
         'ssl_host_name' => $domain
     ]);
     $cli->connect();
-    $req = new swoole_http2_request;
+    $req = new Swoole\Http2\Request;
     $req->path = '/';
     $req->headers = [
         'host' => $domain,
@@ -21,7 +23,7 @@ go(function () {
         'accept' => 'text/html,application/xhtml+xml,application/xml',
         'accept-encoding' => 'gzip'
     ];
-    assert($cli->send($req));
+    Assert::assert($cli->send($req));
     // not recv here (core dump before ver < 4.0.3)
     co::sleep(1);
 });

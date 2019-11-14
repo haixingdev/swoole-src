@@ -1,22 +1,25 @@
 --TEST--
 swoole_coroutine_util: dns lookup
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc';
+skip_if_offline();
+?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 
 $pm = new ProcessManager;
-$pm->parentFunc = function ($pid)
+$pm->parentFunc = function () use ($pm)
 {
-    $data = curlGet("http://127.0.0.1:9501/");
-    echo $data;
-    swoole_process::kill($pid);
+    go(function () use ($pm) {
+        echo httpGetBody("http://127.0.0.1:{$pm->getFreePort()}/");
+        $pm->kill();
+    });
 };
 
 $pm->childFunc = function () use ($pm)
 {
-    $http = new swoole_http_server("127.0.0.1", 9501, SWOOLE_BASE);
+    $http = new swoole_http_server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE);
     $http->set(array(
         'log_file' => '/dev/null'
     ));

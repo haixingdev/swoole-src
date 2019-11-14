@@ -1,17 +1,18 @@
 --TEST--
 swoole_server: unix socket dgram server
-
 --SKIPIF--
 <?php require __DIR__ . '/../include/skipif.inc'; ?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
+use Swoole\Server;
+use Swoole\Client;
 
-parent_child(function ($pid)
-{
-    usleep(100000);
-    $client = new \swoole_client(SWOOLE_SOCK_UNIX_DGRAM, SWOOLE_SOCK_SYNC);
-    $r = $client->connect(UNIXSOCK_SERVER_PATH, 0, -1);
+$pm = new SwooleTest\ProcessManager;
+
+$pm->parentFunc = function ($pid) use ($pm) {
+    $client = new Client(SWOOLE_SOCK_UNIX_DGRAM, SWOOLE_SOCK_SYNC);
+    $r = $client->connect(UNIXSOCK_PATH, 0, -1);
     if ($r === false)
     {
         echo "ERROR";
@@ -20,25 +21,24 @@ parent_child(function ($pid)
     $client->send("SUCCESS");
     echo $client->recv();
     $client->close();
-}, function ()
-{
-    $serv = new \swoole_server(UNIXSOCK_SERVER_PATH, 0, SWOOLE_PROCESS, SWOOLE_UNIX_DGRAM);
-    $serv->set(["worker_num" => 1, 'log_file' => '/dev/null', 'daemonize' => true]);
-    $serv->on("WorkerStart", function (\swoole_server $serv)
-    {
-        swoole_timer_after(1000, function () use ($serv)
-        {
-            @unlink(UNIXSOCK_SERVER_PATH);
-            $serv->shutdown();
-        });
+    @unlink(UNIXSOCK_PATH);
+    $pm->kill();
+};
+
+$pm->childFunc = function () use ($pm) {
+    $serv = new Server(UNIXSOCK_PATH, 0, SWOOLE_PROCESS, SWOOLE_SOCK_UNIX_DGRAM);
+    $serv->set(["worker_num" => 1, 'log_file' => '/dev/null',]);
+    $serv->on("WorkerStart", function (Server $serv) use ($pm) {
+        $pm->wakeup();
     });
-    $serv->on("packet", function (\swoole_server $serv, $data, $addr)
-    {
-        $serv->send($addr['address'], 'SUCCESS');
+    $serv->on("packet", function (Server $serv, $data, $addr) {
+        $serv->send($addr['address'], 'SUCCESS'.PHP_EOL);
     });
     $serv->start();
-});
+};
+
+$pm->childFirst();
+$pm->run();
 ?>
 --EXPECT--
 SUCCESS
-

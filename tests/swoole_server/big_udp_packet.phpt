@@ -10,7 +10,7 @@ require __DIR__ . '/../include/bootstrap.php';
 const N = 65507;
 $port = get_one_free_port();
 
-$pm = new ProcessManager;
+$pm = new SwooleTest\ProcessManager;
 
 $pm->parentFunc = function ($pid) use ($port)
 {
@@ -21,13 +21,13 @@ $pm->parentFunc = function ($pid) use ($port)
     }
     $client->send(str_repeat('A',  N));
     $data = $client->recv();
-    assert(strlen($data) == N);
+    Assert::same(strlen($data), N);
     swoole_process::kill($pid);
 };
 
 $pm->childFunc = function () use ($pm, $port)
 {
-    $serv = new swoole_server("127.0.0.1", $port, SWOOLE_BASE, SWOOLE_SOCK_UDP);
+    $serv = new swoole_server('127.0.0.1', $port, SWOOLE_BASE, SWOOLE_SOCK_UDP);
     $serv->set(['worker_num' => 1, 'log_file' => '/dev/null']);
     $serv->on("workerStart", function ($serv) use ($pm)
     {

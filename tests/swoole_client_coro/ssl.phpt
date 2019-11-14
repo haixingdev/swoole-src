@@ -2,9 +2,8 @@
 swoole_client_coro: ssl client
 --SKIPIF--
 <?php require __DIR__ . '/../include/skipif.inc';
-if (!defined("SWOOLE_SSL")) {
-    echo "skip";
-}
+skip_if_no_ssl();
+skip_if_offline();
 ?>
 --FILE--
 <?php
@@ -30,7 +29,7 @@ go(function () {
         $content .= $read;
     }
     $cli->close();
-    assert(strpos($content, 'map.baidu.com') !== false);
+    Assert::assert(strpos($content, 'map.baidu.com') !== false);
 });
 ?>
 --EXPECT--

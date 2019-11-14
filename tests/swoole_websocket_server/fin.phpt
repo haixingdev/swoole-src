@@ -4,6 +4,8 @@ swoole_websocket_server: websocket server recv and merge fin packages
 <?php require __DIR__ . '/../include/skipif.inc'; ?>
 --FILE--
 <?php
+declare(strict_types=1);
+
 require __DIR__ . '/../include/bootstrap.php';
 $count = 0;
 $pm = new ProcessManager;
@@ -13,7 +15,7 @@ $pm->parentFunc = function (int $pid) use ($pm, &$count) {
             $cli = new \Swoole\Coroutine\Http\Client('127.0.0.1', $pm->getFreePort());
             $cli->set(['timeout' => 5]);
             $ret = $cli->upgrade('/');
-            assert($ret);
+            Assert::assert($ret);
             $rand_list = [];
             $times = MAX_REQUESTS;
             for ($n = $times; $n--;) {
@@ -30,20 +32,20 @@ $pm->parentFunc = function (int $pid) use ($pm, &$count) {
                 } else {
                     $ret = $cli->push($rand, $opcode, $finish);
                 }
-                assert($ret);
+                Assert::assert($ret);
             }
             $frame = $cli->recv();
-            if (assert($frame->data === implode('', $rand_list))) {
+            if (Assert::assert($frame->data === implode('', $rand_list))) {
                 $count++;
             }
         });
     }
     swoole_event_wait();
-    assert($count === MAX_CONCURRENCY);
+    Assert::same($count, MAX_CONCURRENCY);
     $pm->kill();
 };
 $pm->childFunc = function () use ($pm) {
-    $serv = new swoole_websocket_server('127.0.0.1', $pm->getFreePort(), mt_rand(0, 1) ? SWOOLE_BASE : SWOOLE_PROCESS);
+    $serv = new swoole_websocket_server('127.0.0.1', $pm->getFreePort(), SERVER_MODE_RANDOM);
     $serv->set([
         // 'worker_num' => 1,
         'log_file' => '/dev/null'

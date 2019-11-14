@@ -20,15 +20,15 @@ $pm->parentFunc = function (int $pid) use ($pm, &$count) {
             $filename = '/tmp/test-' . $c . '.jpg';
             $offset = mt_rand(0, $raw_file_size);
             $cli->setHeaders(['Range' => "bytes=$offset-"]);
-            assert($cli->download('/', $filename, 0));
+            Assert::assert($cli->download('/', $filename, 0));
             // assert length
-            if (!assert($raw_file_size === ($offset + filesize($filename)))) {
+            if (!Assert::assert($raw_file_size === ($offset + filesize($filename)))) {
                 goto _end;
             }
             // read content
             $raw_file = fopen(TEST_IMAGE, 'r+');
             fseek($raw_file, $offset);
-            if (!assert(co::fread($raw_file) === co::readFile($filename))) {
+            if (!Assert::assert(co::fread($raw_file) === co::readFile($filename))) {
                 goto _end;
             }
 
@@ -37,15 +37,15 @@ $pm->parentFunc = function (int $pid) use ($pm, &$count) {
             @unlink($filename);
             $cli->setHeaders([]);
             $cli->get('/');
-            assert($cli->body === $raw_file_content);
+            Assert::same($cli->body, $raw_file_content);
         });
     }
     swoole_event_wait();
-    assert($count === MAX_CONCURRENCY_LOW);
+    Assert::same($count, MAX_CONCURRENCY_LOW);
     $pm->kill();
 };
 $pm->childFunc = function () use ($pm) {
-    $serv = new swoole_http_server('127.0.0.1', $pm->getFreePort(), mt_rand(0, 1) ? SWOOLE_BASE : SWOOLE_PROCESS);
+    $serv = new swoole_http_server('127.0.0.1', $pm->getFreePort(), SERVER_MODE_RANDOM);
     $serv->set(['log_file' => '/dev/null']);
     $serv->on('workerStart', function () use ($pm) {
         $pm->wakeup();

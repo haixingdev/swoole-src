@@ -11,20 +11,20 @@ $pm->parentFunc = function (int $pid) use ($pm) {
         $cli = new \Swoole\Coroutine\Http\Client('127.0.0.1', 9506);
         $cli->set(['timeout' => 5]);
         $ret = $cli->upgrade('/');
-        assert($ret);
+        Assert::assert($ret);
         foreach (range(1, 100) as $i)
         {
             $ret = $cli->push("hello");
-            assert($ret);
+            Assert::assert($ret);
             $frame = $cli->recv();
-            assert($frame->data == "Swoole: hello");
+            Assert::same($frame->data, "Swoole: hello");
         }
         $pm->kill();
     });
     swoole_event_wait();
 };
 $pm->childFunc = function () use ($pm) {
-    $serv = new swoole_websocket_server('127.0.0.1', $pm->getFreePort(), mt_rand(0, 1) ? SWOOLE_BASE : SWOOLE_PROCESS);
+    $serv = new swoole_websocket_server('127.0.0.1', $pm->getFreePort(), SERVER_MODE_RANDOM);
     $serv->set([
         'worker_num' => 1,
         'log_file'   => '/dev/null'

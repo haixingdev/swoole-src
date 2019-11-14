@@ -3,6 +3,7 @@ swoole_runtime: stream_socket_sendto
 --SKIPIF--
 <?php
 require __DIR__ . '/../include/skipif.inc';
+skip_if_offline();
 ?>
 --FILE--
 <?php
@@ -22,10 +23,9 @@ go(function () {
             $content .= fread($fp, 1024);
         }
         fclose($fp);
-        assert(strpos($content,'map.baidu.com') !== false);
+        Assert::assert(strpos($content,'map.baidu.com') !== false);
     }
 });
 swoole_event_wait();
 ?>
 --EXPECT--
-

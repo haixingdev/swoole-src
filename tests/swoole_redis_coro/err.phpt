@@ -9,14 +9,14 @@ go(function () {
     $redis = new \Swoole\Coroutine\Redis(['timeout' => 3]);
     $redis->connect(REDIS_SERVER_HOST, REDIS_SERVER_PORT);
     $res = $redis->set('foo', 'bar');
-    assert($res && $redis->errCode === 0 && $redis->errMsg === '');
+    Assert::assert($res && $redis->errCode === 0 && $redis->errMsg === '');
     $res = $redis->hIncrBy('foo', 'bar', 123);
-    assert(!$res);
-    var_dump($redis->errCode, $redis->errMsg);
+    Assert::assert(!$res);
+    Assert::same($redis->errType, SWOOLE_REDIS_ERR_OTHER);
+    var_dump($redis->errMsg);
     $res = $redis->set('foo', 'baz');
-    assert($res && $redis->errCode === 0 && $redis->errMsg === '');
+    Assert::assert($res && $redis->errCode === 0 && $redis->errMsg === '');
 });
 ?>
 --EXPECT--
-int(2)
 string(65) "WRONGTYPE Operation against a key holding the wrong kind of value"

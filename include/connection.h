@@ -17,9 +17,7 @@
 #ifndef SW_CONNECTION_H_
 #define SW_CONNECTION_H_
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+SW_EXTERN_C_BEGIN
 
 #include "buffer.h"
 
@@ -41,6 +39,7 @@ typedef struct _swSSL_option
     char *passphrase;
     char *client_cert_file;
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
+    uint8_t disable_tls_host_name :1;
     char *tls_host_name;
 #endif
     char *cafile;
@@ -50,31 +49,62 @@ typedef struct _swSSL_option
     uint8_t disable_compress :1;
     uint8_t verify_peer :1;
     uint8_t allow_self_signed :1;
+    uint32_t disable_protocols;
 } swSSL_option;
 
 #endif
 
-int swConnection_buffer_send(swConnection *conn);
+int swConnection_buffer_send(swSocket *conn);
 
-swString* swConnection_get_string_buffer(swConnection *conn);
-void swConnection_clear_string_buffer(swConnection *conn);
-swBuffer_chunk* swConnection_get_out_buffer(swConnection *conn, uint32_t type);
-swBuffer_chunk* swConnection_get_in_buffer(swConnection *conn);
-int swConnection_sendfile(swConnection *conn, char *filename, off_t offset, size_t length);
-int swConnection_onSendfile(swConnection *conn, swBuffer_chunk *chunk);
+int swConnection_sendfile(swSocket *conn, const char *filename, off_t offset, size_t length);
+int swConnection_onSendfile(swSocket *conn, swBuffer_chunk *chunk);
 void swConnection_sendfile_destructor(swBuffer_chunk *chunk);
-char* swConnection_get_ip(swConnection *conn);
-int swConnection_get_port(swConnection *conn);
+const char* swConnection_get_ip(enum swSocket_type socket_type, swSocketAddress *info);
+int swConnection_get_port(enum swSocket_type socket_type, swSocketAddress *info);
+
+static sw_inline swString *swSocket_get_buffer(swSocket *_socket)
+{
+    swString *buffer = _socket->recv_buffer;
+    if (buffer == NULL)
+    {
+        buffer = swString_new(SW_BUFFER_SIZE_BIG);
+        //alloc memory failed.
+        if (!buffer)
+        {
+            return NULL;
+        }
+        _socket->recv_buffer = buffer;
+    }
+    return buffer;
+}
+
+static sw_inline void swConnection_free_buffer(swSocket *conn)
+{
+    if (conn->recv_buffer)
+    {
+        swString_free(conn->recv_buffer);
+        conn->recv_buffer = NULL;
+    }
+}
 
 #ifdef SW_USE_OPENSSL
-enum swSSLState
+enum swSSL_state
 {
     SW_SSL_STATE_HANDSHAKE    = 0,
     SW_SSL_STATE_READY        = 1,
     SW_SSL_STATE_WAIT_STREAM  = 2,
 };
 
-enum swSSLMethod
+enum swSSL_version
+{
+    SW_SSL_SSLv2 = 0x0002,
+    SW_SSL_SSLv3 = 0x0004,
+    SW_SSL_TLSv1 = 0x0008,
+    SW_SSL_TLSv1_1 = 0x0010,
+    SW_SSL_TLSv1_2 = 0x0020,
+};
+
+enum swSSL_method
 {
     SW_SSLv23_METHOD = 0,
     SW_SSLv3_METHOD,
@@ -120,64 +150,62 @@ int swSSL_server_set_cipher(SSL_CTX* ssl_context, swSSL_config *cfg);
 void swSSL_server_http_advise(SSL_CTX* ssl_context, swSSL_config *cfg);
 SSL_CTX* swSSL_get_context(swSSL_option *option);
 void swSSL_free_context(SSL_CTX* ssl_context);
-int swSSL_create(swConnection *conn, SSL_CTX* ssl_context, int flags);
+int swSSL_create(swSocket *conn, SSL_CTX* ssl_context, int flags);
 int swSSL_set_client_certificate(SSL_CTX *ctx, char *cert_file, int depth);
 int swSSL_set_capath(swSSL_option *cfg, SSL_CTX *ctx);
-int swSSL_check_host(swConnection *conn, char *tls_host_name);
+int swSSL_check_host(swSocket *conn, char *tls_host_name);
 int swSSL_get_client_certificate(SSL *ssl, char *buffer, size_t length);
-int swSSL_verify(swConnection *conn, int allow_self_signed);
-int swSSL_accept(swConnection *conn);
-int swSSL_connect(swConnection *conn);
-void swSSL_close(swConnection *conn);
-ssize_t swSSL_recv(swConnection *conn, void *__buf, size_t __n);
-ssize_t swSSL_send(swConnection *conn, void *__buf, size_t __n);
-int swSSL_sendfile(swConnection *conn, int fd, off_t *offset, size_t size);
+int swSSL_verify(swSocket *conn, int allow_self_signed);
+int swSSL_accept(swSocket *conn);
+int swSSL_connect(swSocket *conn);
+void swSSL_close(swSocket *conn);
+ssize_t swSSL_recv(swSocket *conn, void *__buf, size_t __n);
+ssize_t swSSL_send(swSocket *conn, const void *__buf, size_t __n);
+int swSSL_sendfile(swSocket *conn, int fd, off_t *offset, size_t size);
 #endif
 
 /**
  * Receive data from connection
  */
-static sw_inline ssize_t swConnection_recv(swConnection *conn, void *__buf, size_t __n, int __flags)
+static sw_inline ssize_t swConnection_recv(swSocket *conn, void *__buf, size_t __n, int __flags)
 {
     ssize_t total_bytes = 0;
-    _recv:
-#ifdef SW_USE_OPENSSL
-    if (conn->ssl)
+
+    do
     {
-        ssize_t retval = 0;
-        while ((size_t) total_bytes < __n)
+#ifdef SW_USE_OPENSSL
+        if (conn->ssl)
         {
-            retval = swSSL_recv(conn, ((char*)__buf) + total_bytes, __n - total_bytes);
-            if (retval <= 0)
+            ssize_t retval = 0;
+            while ((size_t) total_bytes < __n)
             {
-                if (total_bytes == 0)
+                retval = swSSL_recv(conn, ((char*)__buf) + total_bytes, __n - total_bytes);
+                if (retval <= 0)
                 {
-                    total_bytes = retval;
+                    if (total_bytes == 0)
+                    {
+                        total_bytes = retval;
+                    }
+                    break;
                 }
-                break;
-            }
-            else
-            {
-                total_bytes += retval;
+                else
+                {
+                    total_bytes += retval;
+                    if (!(conn->nonblock || (__flags & MSG_WAITALL)))
+                    {
+                        break;
+                    }
+                }
             }
         }
-    }
-    else
+        else
 #endif
-    {
-        total_bytes = recv(conn->fd, __buf, __n, __flags);
+        {
+            total_bytes = recv(conn->fd, __buf, __n, __flags);
+        }
     }
+    while (total_bytes < 0 && errno == EINTR);
 
-    if (total_bytes < 0 && errno == EINTR)
-    {
-        goto _recv;
-    }
-    else
-    {
-        goto _return;
-    }
-
-    _return:
 #ifdef SW_DEBUG
     if (total_bytes > 0)
     {
@@ -185,7 +213,7 @@ static sw_inline ssize_t swConnection_recv(swConnection *conn, void *__buf, size
     }
 #endif
 
-    swDebug("recv %ld/%ld bytes, errno=%d", total_bytes, __n, errno);
+    swTraceLog(SW_TRACE_SOCKET, "recv %ld/%ld bytes, errno=%d", total_bytes, __n, errno);
 
     return total_bytes;
 }
@@ -193,39 +221,33 @@ static sw_inline ssize_t swConnection_recv(swConnection *conn, void *__buf, size
 /**
  * Send data to connection
  */
-static sw_inline ssize_t swConnection_send(swConnection *conn, void *__buf, size_t __n, int __flags)
+static sw_inline ssize_t swConnection_send(swSocket *conn, const void *__buf, size_t __n, int __flags)
 {
     ssize_t retval;
-    _send:
+
+    do
+    {
 #ifdef SW_USE_OPENSSL
-    if (conn->ssl)
-    {
-        retval = swSSL_send(conn, __buf, __n);
-    }
-    else
-    {
-        retval = send(conn->fd, __buf, __n, __flags);
-    }
-#else
-    retval = send(conn->fd, __buf, __n, __flags);
+        if (conn->ssl)
+        {
+            retval = swSSL_send(conn, __buf, __n);
+        }
+        else
 #endif
-
-    if (retval < 0 && errno == EINTR)
-    {
-        goto _send;
+        {
+            retval = send(conn->fd, __buf, __n, __flags);
+        }
     }
-    else
-    {
-        goto _return;
-    }
+    while (retval < 0 && errno == EINTR);
 
-    _return:
 #ifdef SW_DEBUG
     if (retval > 0)
     {
         conn->total_send_bytes += retval;
     }
 #endif
+
+    swTraceLog(SW_TRACE_SOCKET, "send %ld/%ld bytes, errno=%d", retval, __n, errno);
 
     return retval;
 }
@@ -234,27 +256,27 @@ static sw_inline ssize_t swConnection_send(swConnection *conn, void *__buf, size
 /**
  * Receive data from connection
  */
-static sw_inline ssize_t swConnection_peek(swConnection *conn, void *__buf, size_t __n, int __flags)
+static sw_inline ssize_t swConnection_peek(swSocket *conn, void *__buf, size_t __n, int __flags)
 {
-    int retval;
-    _peek:
+    ssize_t retval;
+    __flags |= MSG_PEEK;
+    do
+    {
 #ifdef SW_USE_OPENSSL
-    if (conn->ssl)
-    {
-        retval = SSL_peek(conn->ssl, __buf, __n);
-    }
-    else
-    {
-        retval = recv(conn->fd, __buf, __n, __flags);
-    }
-#else
-    retval = recv(conn->fd, __buf, __n, __flags);
+        if (conn->ssl)
+        {
+            retval = SSL_peek(conn->ssl, __buf, __n);
+        }
+        else
 #endif
-
-    if (retval < 0 && errno == EINTR)
-    {
-        goto _peek;
+        {
+            retval = recv(conn->fd, __buf, __n, __flags);
+        }
     }
+    while (retval < 0 && errno == EINTR);
+
+    swTraceLog(SW_TRACE_SOCKET, "peek %ld/%ld bytes, errno=%d", retval, __n, errno);
+
     return retval;
 }
 
@@ -279,20 +301,19 @@ static sw_inline int swConnection_error(int err)
     case EHOSTDOWN:
     case EHOSTUNREACH:
     case SW_ERROR_SSL_BAD_CLIENT:
-		return SW_CLOSE;
-	case EAGAIN:
+    case SW_ERROR_SSL_RESET:
+        return SW_CLOSE;
+    case EAGAIN:
 #ifdef HAVE_KQUEUE
-	case ENOBUFS:
+    case ENOBUFS:
 #endif
-	case 0:
-		return SW_WAIT;
-	default:
-		return SW_ERROR;
-	}
+    case 0:
+        return SW_WAIT;
+    default:
+        return SW_ERROR;
+    }
 }
 
-#ifdef __cplusplus
-}
-#endif
+SW_EXTERN_C_END
 
 #endif /* SW_CONNECTION_H_ */
